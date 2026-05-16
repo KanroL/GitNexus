@@ -22,6 +22,42 @@ import { createHash } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 
+const GENERATED_CONTEXT_FILES = new Set(['AGENTS.md', 'CLAUDE.md']);
+const GENERATED_CONTEXT_DIRS = ['.gitnexus/', '.claude/', '.cursor/'];
+
+const normalizeRelPath = (relPath: string): string => relPath.replace(/\\/g, '/');
+
+/**
+ * Whether a repo-relative path participates in incremental/status hash diffing.
+ *
+ * GitNexus writes `.gitnexus/` internals and AI-context files after the parse
+ * snapshot. Tracking those generated files would make a successful analyze look
+ * stale immediately. Real source and config files remain tracked, including
+ * critical config files such as package.json.
+ */
+export const shouldTrackFileHash = (relPath: string): boolean => {
+  const normalized = normalizeRelPath(relPath);
+  if (GENERATED_CONTEXT_FILES.has(normalized)) return false;
+  return !GENERATED_CONTEXT_DIRS.some(
+    (prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix),
+  );
+};
+
+export const filterTrackedFilePaths = (relPaths: readonly string[]): string[] =>
+  relPaths.map(normalizeRelPath).filter(shouldTrackFileHash);
+
+const filterStoredFileHashes = (
+  stored: Readonly<Record<string, string>> | undefined,
+): Map<string, string> => {
+  const out = new Map<string, string>();
+  if (!stored) return out;
+  for (const [p, h] of Object.entries(stored)) {
+    const normalized = normalizeRelPath(p);
+    if (shouldTrackFileHash(normalized)) out.set(normalized, h);
+  }
+  return out;
+};
+
 /**
  * Compute SHA-256 of a single file. Returns null when the file can't be
  * read — caller treats that as "no signature, assume changed".
@@ -44,9 +80,10 @@ export const computeFileHashes = async (
   relPaths: readonly string[],
 ): Promise<Map<string, string>> => {
   const out = new Map<string, string>();
+  const trackedPaths = filterTrackedFilePaths(relPaths);
   const BATCH = 100;
-  for (let i = 0; i < relPaths.length; i += BATCH) {
-    const batch = relPaths.slice(i, i + BATCH);
+  for (let i = 0; i < trackedPaths.length; i += BATCH) {
+    const batch = trackedPaths.slice(i, i + BATCH);
     const results = await Promise.all(
       batch.map(async (rel) => {
         const h = await computeFileHash(path.join(repoPath, rel));
@@ -80,17 +117,22 @@ export const diffFileHashes = (
   current: ReadonlyMap<string, string>,
   stored: Readonly<Record<string, string>> | undefined,
 ): FileHashDiff => {
-  const storedMap = new Map<string, string>(stored ? Object.entries(stored) : []);
+  const currentMap = new Map<string, string>();
+  for (const [p, h] of current) {
+    const normalized = normalizeRelPath(p);
+    if (shouldTrackFileHash(normalized)) currentMap.set(normalized, h);
+  }
+  const storedMap = filterStoredFileHashes(stored);
   const changed: string[] = [];
   const added: string[] = [];
-  for (const [p, h] of current) {
+  for (const [p, h] of currentMap) {
     const prev = storedMap.get(p);
     if (prev === undefined) added.push(p);
     else if (prev !== h) changed.push(p);
   }
   const deleted: string[] = [];
   for (const p of storedMap.keys()) {
-    if (!current.has(p)) deleted.push(p);
+    if (!currentMap.has(p)) deleted.push(p);
   }
   changed.sort();
   added.sort();

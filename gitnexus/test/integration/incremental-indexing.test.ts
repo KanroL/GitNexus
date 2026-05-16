@@ -135,6 +135,77 @@ describe('incremental indexing integration', () => {
     }
   }, 300_000);
 
+  it('status is up to date immediately after analyze writes context files', async () => {
+    const repo = await setupRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, {}, callbacks());
+
+      const { storagePath, lbugPath, metaPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath,
+        lbugPath,
+        metaPath,
+        meta: meta!,
+      });
+
+      expect(report.changes).toEqual({ added: 0, modified: 0, deleted: 0, unchanged: 4 });
+      expect(report.isUpToDate).toBe(true);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  it('status becomes stale when a source file changes after analyze', async () => {
+    const repo = await setupRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, {}, callbacks());
+      await writeFile(path.join(repo.dbPath, 'src', 'added.ts'), 'export const added = 1;\n');
+
+      const { storagePath, lbugPath, metaPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath,
+        lbugPath,
+        metaPath,
+        meta: meta!,
+      });
+
+      expect(report.changes.added).toBe(1);
+      expect(report.isUpToDate).toBe(false);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  it('status ignores generated GitNexus internal file changes', async () => {
+    const repo = await setupRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, {}, callbacks());
+      await writeFile(path.join(repo.dbPath, '.gitnexus', 'internal.tmp'), 'generated\n');
+
+      const { storagePath, lbugPath, metaPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath,
+        lbugPath,
+        metaPath,
+        meta: meta!,
+      });
+
+      expect(report.changes).toEqual({ added: 0, modified: 0, deleted: 0, unchanged: 4 });
+      expect(report.isUpToDate).toBe(true);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
   it('modified source file incremental result matches force rebuild stats', async () => {
     const repo = await setupRepo();
     try {

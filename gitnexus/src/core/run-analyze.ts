@@ -39,6 +39,7 @@ import { computeFileHashes } from '../storage/file-hash.js';
 import { extractChangedSubgraph } from './incremental/subgraph-extract.js';
 import { deriveIncrementalPlan } from './incremental/plan.js';
 import { deriveIncrementalWriteSet } from './incremental/write-set.js';
+import { validateIncrementalGraphConsistency } from './incremental/validation.js';
 import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
   getCurrentCommit,
@@ -49,7 +50,7 @@ import {
 } from '../storage/git.js';
 import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
-import { EMBEDDING_TABLE_NAME } from './lbug/schema.js';
+import { EMBEDDING_TABLE_NAME, REL_TABLE_NAME } from './lbug/schema.js';
 import { STALE_HASH_SENTINEL } from './lbug/schema.js';
 
 // ---------------------------------------------------------------------------
@@ -153,6 +154,10 @@ export const PHASE_LABELS: Record<string, string> = {
   embeddings: 'Generating embeddings',
   done: 'Done',
 };
+
+const escapeCypherString = (value: string): string => value.replace(/'/g, "''");
+const escapeCypherLabel = (value: string): string => `\`${value.replace(/`/g, '``')}\``;
+const firstCount = (rows: any[]): number => Number(rows?.[0]?.cnt ?? rows?.[0]?.[0] ?? 0);
 
 // ---------------------------------------------------------------------------
 // Main orchestrator
@@ -501,6 +506,38 @@ export async function runFullAnalysis(
           const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
           progress('lbug', pct, msg);
         });
+
+        const validation = await validateIncrementalGraphConsistency({
+          deletedFiles: hashDiff.deleted,
+          effectiveWriteSet,
+          fullGraph: pipelineResult.graph,
+          finalFileHashes: newFileHashes,
+          operations: {
+            countNodesForFile: async (label, filePath) =>
+              firstCount(
+                await executeQuery(
+                  `MATCH (n:${escapeCypherLabel(label)}) WHERE n.filePath = '${escapeCypherString(
+                    filePath,
+                  )}' RETURN count(n) AS cnt`,
+                ),
+              ),
+            countFileNodes: async (filePath) =>
+              firstCount(
+                await executeQuery(
+                  `MATCH (n:File) WHERE n.filePath = '${escapeCypherString(
+                    filePath,
+                  )}' RETURN count(n) AS cnt`,
+                ),
+              ),
+            countGraphWideNodes: async (label) =>
+              firstCount(await executeQuery(`MATCH (n:${label}) RETURN count(n) AS cnt`)),
+            countRelationships: async () =>
+              firstCount(await executeQuery(`MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`)),
+          },
+        });
+        if (validation.ok === false) {
+          throw new Error(`Incremental validation failed: ${validation.reason}`);
+        }
       }
     } else {
       // ── Full rebuild ───────────────────────────────────────────────

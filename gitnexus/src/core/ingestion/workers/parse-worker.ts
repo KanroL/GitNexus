@@ -40,11 +40,10 @@ try {
   Dart = _require('tree-sitter-dart');
 } catch {}
 
-// tree-sitter-kotlin is an optionalDependency — may not be installed
+// tree-sitter-kotlin currently segfaults when loaded inside worker threads on
+// Node 22. Keep Kotlin out of workers; parse-impl routes Kotlin chunks through
+// the sequential parser so Kotlin support is preserved without crashing analyze.
 let Kotlin: TreeSitterLanguage | null = null;
-try {
-  Kotlin = _require('tree-sitter-kotlin');
-} catch {}
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
   FUNCTION_NODE_TYPES,

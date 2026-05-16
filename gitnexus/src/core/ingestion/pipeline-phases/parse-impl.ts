@@ -45,7 +45,7 @@ import {
 } from '../heritage-processor.js';
 import { createResolutionContext } from '../model/resolution-context.js';
 import { ASTCache, createASTCache } from '../ast-cache.js';
-import { type PipelineProgress, getLanguageFromFilename } from 'gitnexus-shared';
+import { type PipelineProgress, getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { readFileContents } from '../filesystem-walker.js';
 import { isLanguageAvailable } from '../../tree-sitter/parser-loader.js';
 import { createWorkerPool } from '../workers/worker-pool.js';
@@ -324,6 +324,11 @@ export async function runChunkedParseAndResolve(
       const chunkFiles = chunkPaths
         .filter((p) => chunkContents.has(p))
         .map((p) => ({ path: p, content: chunkContents.get(p)! }));
+      const chunkWorkerPool = chunkPaths.some(
+        (p) => getLanguageFromFilename(p) === SupportedLanguages.Kotlin,
+      )
+        ? undefined
+        : workerPool;
 
       // Compute the chunk's content-hash signature (if cache available).
       let chunkHash: string | null = null;
@@ -391,7 +396,7 @@ export async function runChunkedParseAndResolve(
               },
             });
           },
-          workerPool,
+          chunkWorkerPool,
           // Capture raw results only when we have a cache to write to —
           // otherwise we'd retain extra arrays for nothing.
           parseCache && chunkHash ? rawResults : undefined,

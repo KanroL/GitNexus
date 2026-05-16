@@ -25,6 +25,32 @@ export interface DeriveIncrementalPlanOptions {
   currentFileHashes: ReadonlyMap<string, string>;
 }
 
+const CRITICAL_CONFIG_BASENAMES = new Set([
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'pyproject.toml',
+  'setup.py',
+  'go.mod',
+  'go.sum',
+  'Cargo.toml',
+  'Cargo.lock',
+  '.gitignore',
+  '.gitnexusignore',
+]);
+
+export const isCriticalProjectConfigFile = (filePath: string): boolean => {
+  const normalized = filePath.replace(/\\/g, '/');
+  const basename = normalized.slice(normalized.lastIndexOf('/') + 1);
+  return (
+    CRITICAL_CONFIG_BASENAMES.has(basename) ||
+    /^tsconfig(?:\..+)?\.json$/.test(basename) ||
+    /^jsconfig(?:\..+)?\.json$/.test(basename) ||
+    /^requirements.*\.txt$/.test(basename)
+  );
+};
+
 export const deriveIncrementalPlan = ({
   force,
   existingMeta,
@@ -61,6 +87,11 @@ export const deriveIncrementalPlan = ({
   }
 
   const hashDiff = diffFileHashes(currentFileHashes, existingMeta.fileHashes);
+  const changedPaths = [...hashDiff.changed, ...hashDiff.added, ...hashDiff.deleted];
+  if (changedPaths.some(isCriticalProjectConfigFile)) {
+    return { mode: 'full', reason: 'critical config file changed' };
+  }
+
   return {
     mode: 'incremental',
     hashDiff,

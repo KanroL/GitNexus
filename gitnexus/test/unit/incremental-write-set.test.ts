@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
-import { deriveIncrementalWriteSet } from '../../src/core/incremental/write-set.js';
+import {
+  deriveIncrementalWriteSet,
+  type IncrementalWriteSetPlan,
+} from '../../src/core/incremental/write-set.js';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
 import type { FileHashDiff } from '../../src/storage/file-hash.js';
 
@@ -24,38 +27,46 @@ const graphWithFiles = (paths: string[] = []) => {
   return graph;
 };
 
+const expectIncremental = (
+  plan: IncrementalWriteSetPlan,
+): Extract<IncrementalWriteSetPlan, { mode: 'incremental' }> => {
+  expect(plan.mode).toBe('incremental');
+  if (plan.mode !== 'incremental') throw new Error(`Expected incremental plan, got ${plan.reason}`);
+  return plan;
+};
+
 describe('deriveIncrementalWriteSet', () => {
   it('includes changed files in the write set', async () => {
-    const plan = await deriveIncrementalWriteSet({
+    const plan = expectIncremental(await deriveIncrementalWriteSet({
       hashDiff: emptyDiff({ changed: ['src/a.ts'], toWrite: ['src/a.ts'] }),
       fullGraph: graphWithFiles(['src/a.ts']),
       queryImporters: async () => [],
-    });
+    }));
 
     expect([...plan.effectiveWriteSet]).toEqual(['src/a.ts']);
     expect(plan.diagnostics.directWriteSetSize).toBe(1);
   });
 
   it('includes added files in the write set', async () => {
-    const plan = await deriveIncrementalWriteSet({
+    const plan = expectIncremental(await deriveIncrementalWriteSet({
       hashDiff: emptyDiff({ added: ['src/new.ts'], toWrite: ['src/new.ts'] }),
       fullGraph: graphWithFiles(['src/new.ts']),
       queryImporters: async () => [],
-    });
+    }));
 
     expect(plan.effectiveWriteSet.has('src/new.ts')).toBe(true);
   });
 
   it('uses deleted files for importer lookup without writing them', async () => {
     const queried: string[] = [];
-    const plan = await deriveIncrementalWriteSet({
+    const plan = expectIncremental(await deriveIncrementalWriteSet({
       hashDiff: emptyDiff({ deleted: ['src/deleted.ts'] }),
       fullGraph: graphWithFiles([]),
       queryImporters: async (filePath) => {
         queried.push(filePath);
         return [];
       },
-    });
+    }));
 
     expect(queried).toEqual(['src/deleted.ts']);
     expect(plan.effectiveWriteSet.has('src/deleted.ts')).toBe(false);
@@ -64,12 +75,12 @@ describe('deriveIncrementalWriteSet', () => {
   });
 
   it('expands the write set with direct importers', async () => {
-    const plan = await deriveIncrementalWriteSet({
+    const plan = expectIncremental(await deriveIncrementalWriteSet({
       hashDiff: emptyDiff({ changed: ['src/provider.ts'], toWrite: ['src/provider.ts'] }),
       fullGraph: graphWithFiles(['src/provider.ts', 'src/consumer.ts']),
       queryImporters: async (filePath) =>
         filePath === 'src/provider.ts' ? ['src/consumer.ts'] : [],
-    });
+    }));
 
     expect([...plan.importerExpandedSet].sort()).toEqual(['src/consumer.ts', 'src/provider.ts']);
     expect(plan.diagnostics.importerExpansionSize).toBe(1);
@@ -80,26 +91,23 @@ describe('deriveIncrementalWriteSet', () => {
       ['src/provider.ts', ['src/consumer-a.ts']],
       ['src/consumer-a.ts', ['src/consumer-b.ts']],
       ['src/consumer-b.ts', ['src/consumer-c.ts']],
-      ['src/consumer-c.ts', ['src/consumer-d.ts']],
     ]);
 
-    const plan = await deriveIncrementalWriteSet({
+    const plan = expectIncremental(await deriveIncrementalWriteSet({
       hashDiff: emptyDiff({ changed: ['src/provider.ts'], toWrite: ['src/provider.ts'] }),
       fullGraph: graphWithFiles([
         'src/provider.ts',
         'src/consumer-a.ts',
         'src/consumer-b.ts',
         'src/consumer-c.ts',
-        'src/consumer-d.ts',
       ]),
       queryImporters: async (filePath) => imports.get(filePath) ?? [],
-    });
+    }));
 
     expect([...plan.importerExpandedSet].sort()).toEqual([
       'src/consumer-a.ts',
       'src/consumer-b.ts',
       'src/consumer-c.ts',
-      'src/consumer-d.ts',
       'src/provider.ts',
     ]);
     expect(plan.diagnostics.importerBfsDepth).toBe(4);
@@ -107,7 +115,7 @@ describe('deriveIncrementalWriteSet', () => {
 
   it('uses shadow candidates from added files to seed importer expansion', async () => {
     const queried: string[] = [];
-    const plan = await deriveIncrementalWriteSet({
+    const plan = expectIncremental(await deriveIncrementalWriteSet({
       hashDiff: emptyDiff({ added: ['src/foo.ts'], toWrite: ['src/foo.ts'] }),
       fullGraph: graphWithFiles(['src/foo.ts', 'src/importer.ts']),
       priorFileHashes: { 'src/foo/index.ts': 'old-hash' },
@@ -115,7 +123,7 @@ describe('deriveIncrementalWriteSet', () => {
         queried.push(filePath);
         return filePath === 'src/foo/index.ts' ? ['src/importer.ts'] : [];
       },
-    });
+    }));
 
     expect(queried).toContain('src/foo/index.ts');
     expect(plan.shadowCandidates).toContain('src/foo/index.ts');
@@ -133,12 +141,63 @@ describe('deriveIncrementalWriteSet', () => {
       properties: {},
     } as unknown as GraphRelationship);
 
-    const plan = await deriveIncrementalWriteSet({
+    const plan = expectIncremental(await deriveIncrementalWriteSet({
       hashDiff: emptyDiff({ changed: ['src/provider.ts'], toWrite: ['src/provider.ts'] }),
       fullGraph: graph,
       queryImporters: async () => [],
-    });
+    }));
 
     expect([...plan.effectiveWriteSet].sort()).toEqual(['src/consumer.ts', 'src/provider.ts']);
+  });
+
+  it('falls back when the effective write set exceeds the ratio threshold', async () => {
+    const files = Array.from({ length: 100 }, (_, i) => `src/file-${i}.ts`);
+    const changed = files.slice(0, 41);
+    const plan = await deriveIncrementalWriteSet({
+      hashDiff: emptyDiff({ changed, toWrite: changed }),
+      fullGraph: graphWithFiles(files),
+      priorFileHashes: Object.fromEntries(files.map((file) => [file, 'hash'])),
+      queryImporters: async () => [],
+    });
+
+    expect(plan).toMatchObject({ mode: 'full', reason: 'write set exceeds threshold' });
+  });
+
+  it('falls back when importer lookup fails', async () => {
+    const plan = await deriveIncrementalWriteSet({
+      hashDiff: emptyDiff({ changed: ['src/provider.ts'], toWrite: ['src/provider.ts'] }),
+      fullGraph: graphWithFiles(['src/provider.ts']),
+      queryImporters: async () => {
+        throw new Error('query failed');
+      },
+    });
+
+    expect(plan).toMatchObject({ mode: 'full', reason: 'importer query failed' });
+  });
+
+  it('falls back when importer expansion exceeds the max depth', async () => {
+    const plan = await deriveIncrementalWriteSet({
+      hashDiff: emptyDiff({ changed: ['src/provider.ts'], toWrite: ['src/provider.ts'] }),
+      fullGraph: graphWithFiles(['src/provider.ts', 'src/consumer.ts']),
+      maxImporterBfsDepth: 1,
+      queryImporters: async (filePath) =>
+        filePath === 'src/provider.ts' ? ['src/consumer.ts'] : [],
+    });
+
+    expect(plan).toMatchObject({
+      mode: 'full',
+      reason: 'importer expansion exceeded max depth',
+    });
+  });
+
+  it('keeps small ordinary changes incremental', async () => {
+    const plan = await deriveIncrementalWriteSet({
+      hashDiff: emptyDiff({ changed: ['src/a.ts'], toWrite: ['src/a.ts'] }),
+      fullGraph: graphWithFiles(['src/a.ts', 'src/b.ts']),
+      priorFileHashes: { 'src/a.ts': 'old-a', 'src/b.ts': 'old-b' },
+      queryImporters: async () => [],
+    });
+
+    expect(plan.mode).toBe('incremental');
   });
 });

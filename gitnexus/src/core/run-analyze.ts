@@ -445,44 +445,63 @@ export async function runFullAnalysis(
         queryImporters,
       });
 
-      if (writeSetPlan.diagnostics.importerExpansionSize > 0) {
-        log(
-          `Incremental: +${writeSetPlan.diagnostics.importerExpansionSize} importer(s) added to writable set ` +
-            `(BFS depth ≤ ${writeSetPlan.diagnostics.importerBfsDepth}` +
-            (writeSetPlan.diagnostics.shadowCandidatesSize > 0
-              ? `, ${writeSetPlan.diagnostics.shadowCandidatesSize} shadow-seed(s)`
-              : '') +
-            `)`,
-        );
-      }
-
-      const { effectiveWriteSet, filesToDelete } = writeSetPlan;
-      for (let i = 0; i < filesToDelete.length; i++) {
-        const f = filesToDelete[i];
-        try {
-          await deleteNodesForFile(f);
-        } catch {
-          /* file may not have rows (e.g. an unparseable file) — fine */
+      if (writeSetPlan.mode === 'full') {
+        log(`Incremental fallback: ${writeSetPlan.reason}`);
+        await closeLbug();
+        const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
+        for (const f of lbugFiles) {
+          try {
+            await fs.rm(f, { recursive: true, force: true });
+          } catch {
+            /* swallow */
+          }
         }
-        if (i % 20 === 0) {
-          progress('lbug', 62, `Removing rows for changed files (${i}/${filesToDelete.length})...`);
+        await initLbug(lbugPath);
+        await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
+          lbugMsgCount++;
+          const pct = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
+          progress('lbug', pct, msg);
+        });
+      } else {
+        if (writeSetPlan.diagnostics.importerExpansionSize > 0) {
+          log(
+            `Incremental: +${writeSetPlan.diagnostics.importerExpansionSize} importer(s) added to writable set ` +
+              `(BFS depth ≤ ${writeSetPlan.diagnostics.importerBfsDepth}` +
+              (writeSetPlan.diagnostics.shadowCandidatesSize > 0
+                ? `, ${writeSetPlan.diagnostics.shadowCandidatesSize} shadow-seed(s)`
+                : '') +
+              `)`,
+          );
         }
-      }
-      // 2. Drop graph-wide nodes (Community, Process). They'll be re-inserted
-      //    from the fresh pipeline output below. Required for the
-      //    "Leiden runs on the FULL graph" correctness invariant.
-      await deleteAllCommunitiesAndProcesses();
 
-      // 3. Extract the changed subgraph from the FULL ctx.graph and write
-      //    only that. Unchanged-file rows in the DB stay untouched. Pass
-      //    the SAME effectiveWriteSet so the subgraph and the deletes
-      //    cover identical files (asymmetry would silently corrupt).
-      const subgraph = extractChangedSubgraph(pipelineResult.graph, effectiveWriteSet);
-      await loadGraphToLbug(subgraph, pipelineResult.repoPath, storagePath, (msg) => {
-        lbugMsgCount++;
-        const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
-        progress('lbug', pct, msg);
-      });
+        const { effectiveWriteSet, filesToDelete } = writeSetPlan;
+        for (let i = 0; i < filesToDelete.length; i++) {
+          const f = filesToDelete[i];
+          try {
+            await deleteNodesForFile(f);
+          } catch {
+            /* file may not have rows (e.g. an unparseable file) — fine */
+          }
+          if (i % 20 === 0) {
+            progress('lbug', 62, `Removing rows for changed files (${i}/${filesToDelete.length})...`);
+          }
+        }
+        // 2. Drop graph-wide nodes (Community, Process). They'll be re-inserted
+        //    from the fresh pipeline output below. Required for the
+        //    "Leiden runs on the FULL graph" correctness invariant.
+        await deleteAllCommunitiesAndProcesses();
+
+        // 3. Extract the changed subgraph from the FULL ctx.graph and write
+        //    only that. Unchanged-file rows in the DB stay untouched. Pass
+        //    the SAME effectiveWriteSet so the subgraph and the deletes
+        //    cover identical files (asymmetry would silently corrupt).
+        const subgraph = extractChangedSubgraph(pipelineResult.graph, effectiveWriteSet);
+        await loadGraphToLbug(subgraph, pipelineResult.repoPath, storagePath, (msg) => {
+          lbugMsgCount++;
+          const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
+          progress('lbug', pct, msg);
+        });
+      }
     } else {
       // ── Full rebuild ───────────────────────────────────────────────
       await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {

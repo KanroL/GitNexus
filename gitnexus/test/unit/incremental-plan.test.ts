@@ -66,6 +66,26 @@ describe('deriveIncrementalPlan', () => {
     ).toEqual({ mode: 'full', reason: 'schema mismatch' });
   });
 
+  it('falls back to full rebuild when a critical config file changes', () => {
+    expect(
+      deriveIncrementalPlan(
+        validInput({
+          existingMeta: baseMeta({
+            fileHashes: {
+              'src/a.ts': 'hash-a',
+              'package.json': 'old-package-hash',
+            },
+          }),
+          allFilePaths: ['src/a.ts', 'package.json'],
+          currentFileHashes: new Map<string, string>([
+            ['src/a.ts', 'hash-a'],
+            ['package.json', 'new-package-hash'],
+          ]),
+        }),
+      ),
+    ).toEqual({ mode: 'full', reason: 'critical config file changed' });
+  });
+
   it('returns an incremental plan with hash diff', () => {
     const plan = deriveIncrementalPlan(
       validInput({

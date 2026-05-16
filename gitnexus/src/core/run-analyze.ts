@@ -35,12 +35,13 @@ import {
   cleanupOldKuzuFiles,
   INCREMENTAL_SCHEMA_VERSION,
 } from '../storage/repo-manager.js';
-import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
+import { computeFileHashes } from '../storage/file-hash.js';
 import {
   extractChangedSubgraph,
   computeEffectiveWriteSet,
 } from './incremental/subgraph-extract.js';
 import { shadowCandidatesFor } from './incremental/shadow-candidates.js';
+import { deriveIncrementalPlan } from './incremental/plan.js';
 import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
   getCurrentCommit,
@@ -192,19 +193,12 @@ export async function runFullAnalysis(
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   const existingMeta = await loadMeta(storagePath);
 
-  // ── Crash recovery: dirty flag forces full rebuild ────────────────
-  // If the previous incremental run set incrementalInProgress and didn't
-  // clear it, the on-disk index may be in a half-state. Cheapest path
-  // back to a known-good index is to wipe + rebuild from scratch.
-  if (existingMeta?.incrementalInProgress) {
-    log(
-      'Previous incremental run did not complete cleanly (incrementalInProgress flag set); ' +
-        'forcing full rebuild to restore a known-good index.',
-    );
+  // Preserve the existing dirty-recovery behavior: downstream embedding
+  // mode treats this as a forced rebuild, while the incremental planner
+  // still reports the more specific fallback reason.
+  const dirtyRecovery = !!existingMeta?.incrementalInProgress;
+  if (dirtyRecovery) {
     options = { ...options, force: true };
-    // Reload meta after clearing the flag in-memory; we still want fileHashes
-    // for the post-rebuild meta carry-over, but force=true ensures the
-    // rebuild path executes.
   }
 
   // ── Early-return: already up to date ──────────────────────────────
@@ -392,18 +386,18 @@ export async function runFullAnalysis(
   // (Bugbot review on PR #1479: a prediction that flipped post-pipeline
   // could skip the embedding cache load and then take the full-rebuild
   // path, silently losing embeddings).
-  const isIncremental =
-    !options.force &&
-    !!existingMeta &&
-    existingMeta.schemaVersion === INCREMENTAL_SCHEMA_VERSION &&
-    !!existingMeta.fileHashes &&
-    Object.keys(existingMeta.fileHashes).length > 0 &&
-    repoHasGit &&
-    allFilePaths.length > 0;
-
-  const hashDiff = isIncremental
-    ? diffFileHashes(newFileHashes, existingMeta!.fileHashes)
-    : undefined;
+  const incrementalPlan = deriveIncrementalPlan({
+    // Dirty recovery sets options.force above to preserve embedding behavior,
+    // but the planner should still surface "dirty recovery" instead of the
+    // generic forced-rebuild reason.
+    force: dirtyRecovery ? false : options.force,
+    existingMeta,
+    repoHasGit,
+    allFilePaths,
+    currentFileHashes: newFileHashes,
+  });
+  const isIncremental = incrementalPlan.mode === 'incremental';
+  const hashDiff = isIncremental ? incrementalPlan.hashDiff : undefined;
 
   if (isIncremental && hashDiff) {
     log(
@@ -424,6 +418,9 @@ export async function runFullAnalysis(
       },
     });
   } else {
+    if (incrementalPlan.mode === 'full') {
+      log(`Incremental fallback: ${incrementalPlan.reason}`);
+    }
     // Full rebuild path: wipe DB files first.
     await closeLbug();
     const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];

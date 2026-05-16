@@ -12,6 +12,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import v8 from 'v8';
 import cliProgress from 'cli-progress';
+import { Command } from 'commander';
 import { closeLbug } from '../core/lbug/lbug-adapter.js';
 import {
   getStoragePaths,
@@ -99,6 +100,8 @@ function ensureHeap(): boolean {
 
 export interface AnalyzeOptions {
   force?: boolean;
+  /** Explicit opt-in alias for the default incremental-when-eligible behavior. */
+  incremental?: boolean;
   /**
    * Embedding generation toggle. Commander parses `--embeddings [limit]` as:
    *   - `undefined` when the flag is omitted
@@ -181,6 +184,22 @@ export const shouldGenerateCommunitySkillFiles = (
   options: Pick<AnalyzeOptions, 'skills' | 'indexOnly'> | undefined,
   pipelineResult: unknown,
 ): boolean => Boolean(options?.skills && pipelineResult && !options?.indexOnly);
+
+export const shouldUseIncremental = (
+  options: Pick<AnalyzeOptions, 'force' | 'incremental'> | undefined,
+): boolean => Boolean(options?.incremental && !options?.force);
+
+export const parseAnalyzeModeOptions = (
+  argv: readonly string[],
+): Pick<AnalyzeOptions, 'force' | 'incremental'> => {
+  const command = new Command();
+  command.exitOverride();
+  command.allowUnknownOption(false);
+  command.option('-f, --force', 'Force full re-index even if up to date');
+  command.option('--incremental', 'Use incremental indexing when eligible');
+  command.parse(['node', 'gitnexus-analyze', ...argv], { from: 'node' });
+  return command.opts<Pick<AnalyzeOptions, 'force' | 'incremental'>>();
+};
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
   if (ensureHeap()) return;
@@ -453,6 +472,9 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
         // needs a fresh pipelineResult. Has no bearing on the registry
         // collision guard (see allowDuplicateName below).
         force: options?.force || options?.skills,
+        // Explicit alias only. The orchestrator already chooses incremental
+        // by default when eligible; --force continues to override it.
+        incremental: shouldUseIncremental(options),
         embeddings: embeddingsEnabled,
         embeddingsNodeLimit,
         dropEmbeddings: options?.dropEmbeddings,

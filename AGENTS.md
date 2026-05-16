@@ -19,7 +19,8 @@ Run commands from the package directory shown unless noted otherwise.
 - Install CLI/core dependencies: `cd gitnexus && npm install`
 - Build CLI/core: `cd gitnexus && npm run build`
 - Run a full analyze from a repository root: `npx gitnexus analyze --force`
-- Run incremental analyze from a repository root: `npx gitnexus analyze`
+- Run incremental analyze from a repository root: `npx gitnexus analyze` or `npx gitnexus analyze --incremental`
+- Show index status and file change stats: `npx gitnexus status`
 - Run all CLI/core tests: `cd gitnexus && npm test`
 - Run CLI/core unit tests: `cd gitnexus && npm run test:unit`
 - Run CLI/core integration tests: `cd gitnexus && npm run test:integration`

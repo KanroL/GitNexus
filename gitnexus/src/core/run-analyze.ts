@@ -71,6 +71,8 @@ export interface AnalyzeOptions {
    * bypass. See `allowDuplicateName` below.
    */
   force?: boolean;
+  /** Explicit opt-in alias for default incremental-when-eligible behavior. */
+  incremental?: boolean;
   embeddings?: boolean;
   /**
    * Override the auto-skip node-count cap for embedding generation.

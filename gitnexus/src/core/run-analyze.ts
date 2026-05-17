@@ -36,6 +36,7 @@ import {
   INCREMENTAL_SCHEMA_VERSION,
 } from '../storage/repo-manager.js';
 import { computeFileHashes } from '../storage/file-hash.js';
+import { walkRepositoryPaths } from './ingestion/filesystem-walker.js';
 import { extractChangedSubgraph } from './incremental/subgraph-extract.js';
 import { deriveIncrementalPlan } from './incremental/plan.js';
 import { deriveIncrementalWriteSet } from './incremental/write-set.js';
@@ -370,17 +371,14 @@ export async function runFullAnalysis(
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB...');
 
-  // Compute current per-file content hashes from the pipeline's File nodes.
-  // Used both to drive the incremental DB writeback (when eligible) and to
-  // populate meta.json.fileHashes for the next run.
-  const allFilePaths: string[] = [];
-  pipelineResult.graph.forEachNode((n) => {
-    if (n.label === 'File') {
-      const fp = n.properties?.filePath as string | undefined;
-      if (fp) allFilePaths.push(fp);
-    }
-  });
-  const newFileHashes = await computeFileHashes(repoPath, allFilePaths);
+  // Compute current per-file content hashes from the same repository scan that
+  // `gitnexus status` uses. Deriving hashes from graph File nodes let analyze
+  // and status drift whenever generated files or non-symbol files were present.
+  // `computeFileHashes` applies the shared generated-file filter while keeping
+  // real source/config files such as package.json tracked.
+  const scannedFilePaths = (await walkRepositoryPaths(repoPath)).map((f) => f.path);
+  const newFileHashes = await computeFileHashes(repoPath, scannedFilePaths);
+  const allFilePaths = [...newFileHashes.keys()];
 
   // Decide incremental vs full at THIS point (post-pipeline, pre-DB).
   // All eligibility conditions are checked here against the actual

@@ -182,6 +182,60 @@ describe('incremental indexing integration', () => {
     }
   }, 300_000);
 
+  it('status is up to date after incremental analyze updates source hashes', async () => {
+    const repo = await setupRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, {}, callbacks());
+      await writeFile(path.join(repo.dbPath, 'src', 'provider.ts'), "export function value() { return 'v2'; }\n");
+      await runFullAnalysis(repo.dbPath, {}, callbacks());
+
+      const { storagePath, lbugPath, metaPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath,
+        lbugPath,
+        metaPath,
+        meta: meta!,
+      });
+
+      expect(report.changes).toEqual({ added: 0, modified: 0, deleted: 0, unchanged: 4 });
+      expect(report.isUpToDate).toBe(true);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('package.json fallback analyze refreshes status hashes', async () => {
+    const repo = await setupRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, {}, callbacks());
+      await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"changed-fixture"}\n');
+      const logs: string[] = [];
+      await runFullAnalysis(repo.dbPath, {}, callbacks(logs));
+      expect(logs.some((line) => line.includes('Incremental fallback: critical config file changed'))).toBe(
+        true,
+      );
+
+      const { storagePath, lbugPath, metaPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath,
+        lbugPath,
+        metaPath,
+        meta: meta!,
+      });
+
+      expect(report.changes).toEqual({ added: 0, modified: 0, deleted: 0, unchanged: 4 });
+      expect(report.isUpToDate).toBe(true);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+
   it('status ignores generated GitNexus internal file changes', async () => {
     const repo = await setupRepo();
     try {

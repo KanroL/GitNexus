@@ -79,4 +79,28 @@ describe('safeClose — close + reopen does not surface lock errors', () => {
       await repoB.cleanup();
     }
   });
+
+  itLbugReopen('withLbugDb releases the database handle after each operation', async () => {
+    const tmp = await createTempDir('gitnexus-lbug-withdb-release-');
+    const dbPath = path.join(tmp.dbPath, 'lbug');
+
+    try {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+
+      await adapter.withLbugDb(dbPath, async () => {
+        await adapter.executeQuery(
+          "CREATE (:File {id: 'file:release', name: 'release.ts', filePath: 'release.ts', content: 'x'})",
+        );
+      });
+
+      expect(adapter.isLbugReady()).toBe(false);
+
+      await adapter.initLbug(dbPath);
+      expect(adapter.isLbugReady()).toBe(true);
+    } finally {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      await adapter.closeLbug().catch(() => {});
+      await tmp.cleanup();
+    }
+  });
 });

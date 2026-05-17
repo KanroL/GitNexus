@@ -452,7 +452,15 @@ export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>)
     try {
       return await runWithSessionLock(async () => {
         await ensureLbugInitialized(dbPath);
-        return operation();
+        try {
+          return await operation();
+        } finally {
+          // HTTP/server read paths use this helper for short operations. Keeping
+          // the singleton Database open between requests holds LadybugDB's file
+          // lock and blocks `gitnexus analyze` in another process. Close after
+          // each operation; long-lived writers use initLbug/closeLbug directly.
+          await closeLbug();
+        }
       });
     } catch (err) {
       lastError = err;

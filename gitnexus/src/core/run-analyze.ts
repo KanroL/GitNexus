@@ -649,28 +649,28 @@ export async function runFullAnalysis(
     }
 
     // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
-    const stats = await getLbugStats();
+    const preEmbeddingStats = await getLbugStats();
     let embeddingSkipped = true;
     let semanticMode: 'vector-index' | 'exact-scan' | undefined;
 
     if (shouldGenerateEmbeddings) {
       const { skipForCap, capDisabled, nodeLimit } = deriveEmbeddingCap(
-        stats.nodes,
+        preEmbeddingStats.nodes,
         options.embeddingsNodeLimit,
       );
       if (!skipForCap) {
         embeddingSkipped = false;
-        if (capDisabled && stats.nodes > DEFAULT_EMBEDDING_NODE_LIMIT) {
+        if (capDisabled && preEmbeddingStats.nodes > DEFAULT_EMBEDDING_NODE_LIMIT) {
           log(
             `Embedding node-count cap disabled — generating embeddings for ` +
-              `${stats.nodes.toLocaleString()} nodes. Ensure sufficient memory; ` +
+              `${preEmbeddingStats.nodes.toLocaleString()} nodes. Ensure sufficient memory; ` +
               `the default ${DEFAULT_EMBEDDING_NODE_LIMIT.toLocaleString()}-node ` +
               `cap exists to prevent OOM.`,
           );
         }
       } else {
         log(
-          `Embeddings skipped: ${stats.nodes.toLocaleString()} nodes exceeds ` +
+          `Embeddings skipped: ${preEmbeddingStats.nodes.toLocaleString()} nodes exceeds ` +
             `the ${nodeLimit.toLocaleString()}-node safety cap. ` +
             `Override with \`--embeddings 0\` to disable the cap, or ` +
             `\`--embeddings <n>\` to set a custom cap.`,
@@ -741,7 +741,20 @@ export async function runFullAnalysis(
     }
 
     // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
+    progress('done', 98, 'Finalizing database...');
+
+    // Force a CHECKPOINT + close, then reopen before marking the run clean in
+    // meta.json. This proves the DB is readable after LadybugDB WAL replay and
+    // prevents a successful incremental analyze from publishing clean metadata
+    // while leaving a WAL state that `gitnexus serve` cannot open.
+    const checkpointReopenStart = Date.now();
+    await closeLbug();
+    await initLbug(lbugPath);
+    profile.checkpointReopenMs = Date.now() - checkpointReopenStart;
+
     progress('done', 98, 'Saving metadata...');
+
+    const stats = await getLbugStats();
 
     // Count embeddings in the index (cached + newly generated)
     let embeddingCount = 0;

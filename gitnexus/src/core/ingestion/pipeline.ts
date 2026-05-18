@@ -125,10 +125,20 @@ export const runPipelineFromRepo = async (
   });
 
   // Extract final results for the PipelineResult contract
-  const { totalFiles, usedWorkerPool } = getPhaseOutput<{
+  const parseOutput = getPhaseOutput<{
     totalFiles: number;
     usedWorkerPool: boolean;
+    parseCacheHits: number;
+    parseCacheMisses: number;
+    parsedFilesCount: number;
+    replayedFiles: number;
   }>(results, 'parse');
+  const { totalFiles, usedWorkerPool } = parseOutput;
+
+  const phaseTimings: Record<string, number> = {};
+  for (const [phaseName, result] of results) {
+    phaseTimings[phaseName] = result.durationMs;
+  }
 
   let communityResult: CommunitiesOutput['communityResult'] | undefined;
   let processResult: ProcessesOutput['processResult'] | undefined;
@@ -159,5 +169,12 @@ export const runPipelineFromRepo = async (
     communityResult,
     processResult,
     usedWorkerPool,
+    phaseTimings,
+    parseStats: {
+      parseCacheHits: parseOutput.parseCacheHits,
+      parseCacheMisses: parseOutput.parseCacheMisses,
+      parsedFiles: parseOutput.parsedFilesCount,
+      replayedFiles: parseOutput.replayedFiles,
+    },
   };
 };

@@ -95,6 +95,14 @@ export interface ParseOutput {
    * falls back to a fresh extract for those.
    */
   readonly parsedFiles: readonly ParsedFile[];
+  /** Number of chunk-level parse-cache hits. */
+  readonly parseCacheHits: number;
+  /** Number of chunk-level parse-cache misses. */
+  readonly parseCacheMisses: number;
+  /** Number of files that went through live parse/extract work. */
+  readonly parsedFilesCount: number;
+  /** Future file-artifact replay counter; intentionally 0 until that feature exists. */
+  readonly replayedFiles: number;
 }
 
 export const parsePhase: PipelinePhase<ParseOutput> = {

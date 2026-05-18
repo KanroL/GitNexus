@@ -17,4 +17,14 @@ export interface PipelineResult {
    * so regression suites can prove which path executed.
    */
   usedWorkerPool: boolean;
+  /** Wall-clock duration by ingestion phase, in milliseconds. */
+  phaseTimings: Record<string, number>;
+  /** Parse/cache counters surfaced for analyze profiling. */
+  parseStats: {
+    parseCacheHits: number;
+    parseCacheMisses: number;
+    parsedFiles: number;
+    /** Reserved for the future file-artifact replay path; always 0 today. */
+    replayedFiles: number;
+  };
 }

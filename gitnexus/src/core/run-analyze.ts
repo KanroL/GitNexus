@@ -160,6 +160,45 @@ const escapeCypherString = (value: string): string => value.replace(/'/g, "''");
 const escapeCypherLabel = (value: string): string => `\`${value.replace(/`/g, '``')}\``;
 const firstCount = (rows: any[]): number => Number(rows?.[0]?.cnt ?? rows?.[0]?.[0] ?? 0);
 
+interface AnalyzeProfileTimings {
+  scanMs: number;
+  hashMs: number;
+  incrementalPlanningMs: number;
+  parseExtractMs: number;
+  graphAssemblyMs: number;
+  crossFileMs: number;
+  communitiesMs: number;
+  processesMs: number;
+  dbWritebackMs: number;
+  validationMs: number;
+  checkpointReopenMs: number;
+  totalAnalyzeMs: number;
+}
+
+interface AnalyzeProfileCounters {
+  parseCacheHits: number;
+  parseCacheMisses: number;
+  parsedFiles: number;
+  replayedFiles: number;
+}
+
+export const isAnalyzeProfilingEnabled = (): boolean => process.env.GITNEXUS_VERBOSE === '1';
+
+const sumTimings = (timings: Record<string, number>, phaseNames: readonly string[]): number =>
+  phaseNames.reduce((total, name) => total + (timings[name] ?? 0), 0);
+
+const formatMs = (ms: number): string => `${Math.max(0, Math.round(ms))}ms`;
+
+export const formatAnalyzeProfileLog = (
+  timings: AnalyzeProfileTimings,
+  counters: AnalyzeProfileCounters,
+): string[] => [
+  'Analyze profile:',
+  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, replayedFiles=${counters.replayedFiles}`,
+  `  pipeline: scan=${formatMs(timings.scanMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, graphAssembly=${formatMs(timings.graphAssemblyMs)}, crossFile=${formatMs(timings.crossFileMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
+  `  orchestration: hash=${formatMs(timings.hashMs)}, incrementalPlanning=${formatMs(timings.incrementalPlanningMs)}, dbWriteback=${formatMs(timings.dbWritebackMs)}, validation=${formatMs(timings.validationMs)}, checkpointReopen=${formatMs(timings.checkpointReopenMs)}, total=${formatMs(timings.totalAnalyzeMs)}`,
+];
+
 // ---------------------------------------------------------------------------
 // Main orchestrator
 // ---------------------------------------------------------------------------
@@ -180,9 +219,17 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  const analyzeStart = Date.now();
   const log = (msg: string) => callbacks.onLog?.(msg);
   const progress = (phase: string, percent: number, message: string) =>
     callbacks.onProgress(phase, percent, message);
+  const profile = {
+    hashMs: 0,
+    incrementalPlanningMs: 0,
+    dbWritebackMs: 0,
+    validationMs: 0,
+    checkpointReopenMs: 0,
+  };
 
   const { storagePath, lbugPath } = getStoragePaths(repoPath);
 
@@ -376,8 +423,10 @@ export async function runFullAnalysis(
   // and status drift whenever generated files or non-symbol files were present.
   // `computeFileHashes` applies the shared generated-file filter while keeping
   // real source/config files such as package.json tracked.
+  const hashStart = Date.now();
   const scannedFilePaths = (await walkRepositoryPaths(repoPath)).map((f) => f.path);
   const newFileHashes = await computeFileHashes(repoPath, scannedFilePaths);
+  profile.hashMs = Date.now() - hashStart;
   const allFilePaths = [...newFileHashes.keys()];
 
   // Decide incremental vs full at THIS point (post-pipeline, pre-DB).
@@ -386,6 +435,7 @@ export async function runFullAnalysis(
   // (Bugbot review on PR #1479: a prediction that flipped post-pipeline
   // could skip the embedding cache load and then take the full-rebuild
   // path, silently losing embeddings).
+  const planningStart = Date.now();
   const incrementalPlan = deriveIncrementalPlan({
     // Dirty recovery sets options.force above to preserve embedding behavior,
     // but the planner should still surface "dirty recovery" instead of the
@@ -396,8 +446,11 @@ export async function runFullAnalysis(
     allFilePaths,
     currentFileHashes: newFileHashes,
   });
+  profile.incrementalPlanningMs = Date.now() - planningStart;
   const isIncremental = incrementalPlan.mode === 'incremental';
   const hashDiff = isIncremental ? incrementalPlan.hashDiff : undefined;
+
+  const dbWritebackStart = Date.now();
 
   if (isIncremental && hashDiff) {
     log(
@@ -505,6 +558,7 @@ export async function runFullAnalysis(
           progress('lbug', pct, msg);
         });
 
+        const validationStart = Date.now();
         const validation = await validateIncrementalGraphConsistency({
           deletedFiles: hashDiff.deleted,
           effectiveWriteSet,
@@ -533,6 +587,7 @@ export async function runFullAnalysis(
               firstCount(await executeQuery(`MATCH ()-[r:${REL_TABLE_NAME}]->() RETURN count(r) AS cnt`)),
           },
         });
+        profile.validationMs += Date.now() - validationStart;
         if (validation.ok === false) {
           throw new Error(`Incremental validation failed: ${validation.reason}`);
         }
@@ -545,6 +600,7 @@ export async function runFullAnalysis(
         progress('lbug', pct, msg);
       });
     }
+    profile.dbWritebackMs = Date.now() - dbWritebackStart - profile.validationMs;
 
     // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
     progress('fts', 85, 'Creating search indexes...');
@@ -827,6 +883,41 @@ export async function runFullAnalysis(
 
     // ── Close LadybugDB ──────────────────────────────────────────────
     await closeLbug();
+
+    if (isAnalyzeProfilingEnabled()) {
+      const phaseTimings = pipelineResult.phaseTimings ?? {};
+      const profileLines = formatAnalyzeProfileLog(
+        {
+          scanMs: phaseTimings.scan ?? 0,
+          hashMs: profile.hashMs,
+          incrementalPlanningMs: profile.incrementalPlanningMs,
+          parseExtractMs: phaseTimings.parse ?? 0,
+          graphAssemblyMs: sumTimings(phaseTimings, [
+            'structure',
+            'markdown',
+            'cobol',
+            'routes',
+            'tools',
+            'orm',
+            'mro',
+          ]),
+          crossFileMs: phaseTimings.crossFile ?? 0,
+          communitiesMs: phaseTimings.communities ?? 0,
+          processesMs: phaseTimings.processes ?? 0,
+          dbWritebackMs: profile.dbWritebackMs,
+          validationMs: profile.validationMs,
+          checkpointReopenMs: profile.checkpointReopenMs,
+          totalAnalyzeMs: Date.now() - analyzeStart,
+        },
+        pipelineResult.parseStats ?? {
+          parseCacheHits: 0,
+          parseCacheMisses: 0,
+          parsedFiles: 0,
+          replayedFiles: 0,
+        },
+      );
+      for (const line of profileLines) log(line);
+    }
 
     progress('done', 100, 'Done');
 

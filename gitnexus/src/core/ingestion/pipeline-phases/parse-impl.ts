@@ -140,6 +140,10 @@ export async function runChunkedParseAndResolve(
    *  cache analyze run can skip the dominant `extractParsedFile` cost
    *  (otherwise ~58s on a 1000-file repo). */
   parsedFiles: import('gitnexus-shared').ParsedFile[];
+  parseCacheHits: number;
+  parseCacheMisses: number;
+  parsedFilesCount: number;
+  replayedFiles: number;
 }> {
   const ctx = createResolutionContext();
   const symbolTable = ctx.model.symbols;
@@ -315,6 +319,7 @@ export async function runChunkedParseAndResolve(
   const parseCache = options?.parseCache;
   let chunkCacheHits = 0;
   let chunkCacheMisses = 0;
+  let liveParsedFiles = 0;
 
   try {
     for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
@@ -374,6 +379,7 @@ export async function runChunkedParseAndResolve(
         // Cache miss: dispatch to workers, capture the raw results, store
         // them under the chunk hash for the next run.
         chunkCacheMisses++;
+        liveParsedFiles += chunkFiles.length;
         const rawResults: ParseWorkerResult[] = [];
         chunkWorkerData = await processParsing(
           graph,
@@ -749,5 +755,9 @@ export async function runChunkedParseAndResolve(
     // a re-extraction cache: when the file's ParsedFile is here,
     // scope-resolution skips its own `extractParsedFile` call.
     parsedFiles: allParsedFiles,
+    parseCacheHits: chunkCacheHits,
+    parseCacheMisses: chunkCacheMisses,
+    parsedFilesCount: liveParsedFiles,
+    replayedFiles: 0,
   };
 }

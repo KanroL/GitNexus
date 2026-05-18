@@ -22,6 +22,40 @@ describe('run-analyze module', () => {
     expect(mod.PHASE_LABELS.parsing).toBe('Parsing code');
   });
 
+  it('formats analyze profiling counters and timings for verbose logs', async () => {
+    const { formatAnalyzeProfileLog } = await import('../../src/core/run-analyze.js');
+
+    const lines = formatAnalyzeProfileLog(
+      {
+        scanMs: 1,
+        hashMs: 2,
+        incrementalPlanningMs: 3,
+        parseExtractMs: 4,
+        graphAssemblyMs: 5,
+        crossFileMs: 6,
+        communitiesMs: 7,
+        processesMs: 8,
+        dbWritebackMs: 9,
+        validationMs: 10,
+        checkpointReopenMs: 11,
+        totalAnalyzeMs: 12,
+      },
+      {
+        parseCacheHits: 13,
+        parseCacheMisses: 14,
+        parsedFiles: 15,
+        replayedFiles: 0,
+      },
+    );
+
+    expect(lines).toEqual([
+      'Analyze profile:',
+      '  counters: parseCacheHits=13, parseCacheMisses=14, parsedFiles=15, replayedFiles=0',
+      '  pipeline: scan=1ms, parseExtract=4ms, graphAssembly=5ms, crossFile=6ms, communities=7ms, processes=8ms',
+      '  orchestration: hash=2ms, incrementalPlanning=3ms, dbWriteback=9ms, validation=10ms, checkpointReopen=11ms, total=12ms',
+    ]);
+  });
+
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-');
     try {

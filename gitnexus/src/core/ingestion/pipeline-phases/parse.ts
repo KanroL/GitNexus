@@ -31,6 +31,7 @@ import type {
 import type { createResolutionContext } from '../model/resolution-context.js';
 import { runChunkedParseAndResolve } from './parse-impl.js';
 import type { ASTCache } from '../ast-cache.js';
+import type { CapturedFileParseArtifact } from '../../../storage/file-artifact-cache.js';
 
 export interface ParseOutput {
   /**
@@ -103,6 +104,8 @@ export interface ParseOutput {
   readonly parsedFilesCount: number;
   /** Future file-artifact replay counter; intentionally 0 until that feature exists. */
   readonly replayedFiles: number;
+  /** Worker-equivalent per-file artifacts captured for persistence after successful analyze. */
+  readonly fileParseArtifacts: readonly CapturedFileParseArtifact[];
 }
 
 export const parsePhase: PipelinePhase<ParseOutput> = {

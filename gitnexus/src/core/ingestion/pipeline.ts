@@ -18,6 +18,7 @@
 import { createKnowledgeGraph } from '../graph/graph.js';
 import { type PipelineProgress } from 'gitnexus-shared';
 import { PipelineResult } from '../../types/pipeline.js';
+import type { CapturedFileParseArtifact } from '../../storage/file-artifact-cache.js';
 import {
   runPipeline,
   getPhaseOutput,
@@ -132,6 +133,7 @@ export const runPipelineFromRepo = async (
     parseCacheMisses: number;
     parsedFilesCount: number;
     replayedFiles: number;
+    fileParseArtifacts: readonly CapturedFileParseArtifact[];
   }>(results, 'parse');
   const { totalFiles, usedWorkerPool } = parseOutput;
 
@@ -176,5 +178,6 @@ export const runPipelineFromRepo = async (
       parsedFiles: parseOutput.parsedFilesCount,
       replayedFiles: parseOutput.replayedFiles,
     },
+    fileParseArtifacts: parseOutput.fileParseArtifacts,
   };
 };

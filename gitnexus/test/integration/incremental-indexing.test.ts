@@ -1,10 +1,14 @@
 import { execSync } from 'child_process';
-import { mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { access, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
 import { closeLbug, executeQuery, initLbug } from '../../src/core/lbug/lbug-adapter.js';
 import { getStoragePaths, loadMeta } from '../../src/storage/repo-manager.js';
+import {
+  getFileArtifactCacheDir,
+  loadFileParseArtifact,
+} from '../../src/storage/file-artifact-cache.js';
 import { buildStatusReport } from '../../src/cli/status.js';
 import { createTempDir } from '../helpers/test-db.js';
 
@@ -123,6 +127,65 @@ describe('incremental indexing integration', () => {
       await repo.cleanup();
     }
   }, 240_000);
+
+  it('initial analyze populates the per-file artifact cache for worker-parsed files', async () => {
+    const repo = await createTempDir('gitnexus-artifact-cache-int-');
+    try {
+      const src = path.join(repo.dbPath, 'src');
+      await mkdir(src, { recursive: true });
+      for (let i = 0; i < 15; i++) {
+        await writeFile(
+          path.join(src, `artifact-${i}.ts`),
+          `export function artifact${i}(): number { return ${i}; }\n`,
+        );
+      }
+      await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"artifact-fixture"}\n');
+      execSync('git init', { cwd: repo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
+        cwd: repo.dbPath,
+        stdio: 'pipe',
+      });
+      execSync(
+        'git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m initial',
+        {
+          cwd: repo.dbPath,
+          stdio: 'pipe',
+        },
+      );
+
+      const result = await runFullAnalysis(
+        repo.dbPath,
+        {
+          ...analyzeOptions,
+          workerThresholdsForTest: { minFiles: 1, minBytes: 1 },
+        },
+        callbacks(),
+      );
+      expect(result.pipelineResult?.usedWorkerPool).toBe(true);
+      expect(result.pipelineResult?.fileParseArtifacts?.length).toBeGreaterThan(0);
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      const indexPath = path.join(getFileArtifactCacheDir(storagePath), 'index.json');
+      await expect(access(indexPath)).resolves.toBeUndefined();
+
+      const index = JSON.parse(await readFile(indexPath, 'utf-8')) as {
+        artifacts?: Array<{ filePath: string; contentHash: string }>;
+      };
+      expect(index.artifacts?.length).toBeGreaterThan(0);
+      const firstArtifact = index.artifacts![0];
+
+      const artifact = await loadFileParseArtifact(storagePath, {
+        filePath: firstArtifact.filePath,
+        contentHash: firstArtifact.contentHash,
+      });
+      expect(artifact).not.toBeNull();
+      expect(artifact?.payload.fileCount).toBe(1);
+      expect(
+        artifact?.payload.nodes.some((node) => node.properties.filePath === artifact.filePath),
+      ).toBe(true);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
 
   it('second analyze with no changes returns already up to date', async () => {
     const repo = await setupRepo();

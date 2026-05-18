@@ -11,6 +11,7 @@ import {
   loadFileParseArtifact,
   pruneFileArtifactCache,
   saveFileParseArtifact,
+  splitParseWorkerResultsByFile,
 } from '../../src/storage/file-artifact-cache.js';
 
 const minimalResult = (overrides: Partial<ParseWorkerResult> = {}): ParseWorkerResult => ({
@@ -59,6 +60,110 @@ const shardPaths = async (storagePath: string): Promise<string[]> => {
 };
 
 describe('file artifact cache', () => {
+  it('splits batch worker results into safe per-file artifacts', () => {
+    const batch = minimalResult({
+      nodes: [
+        {
+          id: 'Function:src/a.ts:runA',
+          label: 'Function',
+          properties: {
+            name: 'runA',
+            filePath: 'src/a.ts',
+            startLine: 1,
+            endLine: 1,
+            language: 'typescript',
+            isExported: true,
+          },
+        } as ParseWorkerResult['nodes'][number],
+        {
+          id: 'Function:src/b.ts:runB',
+          label: 'Function',
+          properties: {
+            name: 'runB',
+            filePath: 'src/b.ts',
+            startLine: 1,
+            endLine: 1,
+            language: 'typescript',
+            isExported: true,
+          },
+        } as ParseWorkerResult['nodes'][number],
+      ],
+      relationships: [
+        {
+          id: 'DEFINES:a',
+          sourceId: 'File:src/a.ts',
+          targetId: 'Function:src/a.ts:runA',
+          type: 'DEFINES',
+          confidence: 1,
+          reason: 'test',
+        },
+        {
+          id: 'CALLS:a-b',
+          sourceId: 'Function:src/a.ts:runA',
+          targetId: 'Function:src/b.ts:runB',
+          type: 'CALLS',
+          confidence: 1,
+          reason: 'cross-file skipped',
+        },
+      ] as ParseWorkerResult['relationships'],
+      symbols: [
+        { filePath: 'src/a.ts', name: 'runA', nodeId: 'Function:src/a.ts:runA', type: 'Function' },
+        { filePath: 'src/b.ts', name: 'runB', nodeId: 'Function:src/b.ts:runB', type: 'Function' },
+      ] as ParseWorkerResult['symbols'],
+      imports: [{ filePath: 'src/a.ts', rawImportPath: './b', language: 'typescript' }],
+      calls: [{ filePath: 'src/a.ts', calledName: 'runB', sourceId: 'Function:src/a.ts:runA' }],
+      assignments: [
+        {
+          filePath: 'src/a.ts',
+          sourceId: 'Function:src/a.ts:runA',
+          receiverText: 'x',
+          propertyName: 'y',
+        },
+      ],
+      heritage: [
+        { filePath: 'src/b.ts', className: 'Child', parentName: 'Base', kind: 'extends' },
+      ],
+      routes: [
+        {
+          filePath: 'src/a.ts',
+          httpMethod: 'GET',
+          routePath: '/a',
+          controllerName: null,
+          methodName: null,
+          middleware: [],
+          prefix: null,
+          lineNumber: 1,
+        },
+      ],
+      toolDefs: [
+        { filePath: 'src/b.ts', toolName: 'toolB', description: 'Tool B', lineNumber: 1 },
+      ],
+      ormQueries: [
+        { filePath: 'src/a.ts', orm: 'prisma', model: 'User', method: 'findMany', lineNumber: 1 },
+      ],
+      parsedFiles: [{ filePath: 'src/b.ts', scopes: [] }] as ParseWorkerResult['parsedFiles'],
+    });
+
+    const split = splitParseWorkerResultsByFile([batch]);
+    expect(split.map((artifact) => artifact.filePath)).toEqual(['src/a.ts', 'src/b.ts']);
+
+    const a = split.find((artifact) => artifact.filePath === 'src/a.ts')?.payload;
+    const b = split.find((artifact) => artifact.filePath === 'src/b.ts')?.payload;
+    expect(a?.nodes).toHaveLength(1);
+    expect(a?.symbols).toHaveLength(1);
+    expect(a?.imports).toHaveLength(1);
+    expect(a?.calls).toHaveLength(1);
+    expect(a?.assignments).toHaveLength(1);
+    expect(a?.routes).toHaveLength(1);
+    expect(a?.ormQueries).toHaveLength(1);
+    expect(a?.relationships.map((rel) => rel.id)).toEqual(['DEFINES:a']);
+    expect(b?.nodes).toHaveLength(1);
+    expect(b?.heritage).toHaveLength(1);
+    expect(b?.toolDefs).toHaveLength(1);
+    expect(b?.parsedFiles).toHaveLength(1);
+    expect(b?.relationships).toHaveLength(0);
+  });
+
   it('saves and loads a per-file artifact', async () => {
     await withTempStorage(async (storagePath) => {
       await saveFileParseArtifact(storagePath, {

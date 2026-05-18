@@ -19,6 +19,10 @@ import {
 } from '../binding-accumulator.js';
 import { processParsing, mergeChunkResults } from '../parsing-processor.js';
 import { fileContentHash, computeChunkHash } from '../../../storage/parse-cache.js';
+import {
+  splitParseWorkerResultsByFile,
+  type CapturedFileParseArtifact,
+} from '../../../storage/file-artifact-cache.js';
 import type { ParseWorkerResult } from '../workers/parse-worker.js';
 import type { WorkerExtractedData } from '../parsing-processor.js';
 import {
@@ -144,6 +148,7 @@ export async function runChunkedParseAndResolve(
   parseCacheMisses: number;
   parsedFilesCount: number;
   replayedFiles: number;
+  fileParseArtifacts: CapturedFileParseArtifact[];
 }> {
   const ctx = createResolutionContext();
   const symbolTable = ctx.model.symbols;
@@ -320,6 +325,12 @@ export async function runChunkedParseAndResolve(
   let chunkCacheHits = 0;
   let chunkCacheMisses = 0;
   let liveParsedFiles = 0;
+  const fileParseArtifacts = new Map<string, CapturedFileParseArtifact>();
+  const captureFileArtifacts = (rawResults: readonly ParseWorkerResult[]) => {
+    for (const artifact of splitParseWorkerResultsByFile(rawResults)) {
+      fileParseArtifacts.set(artifact.filePath, artifact);
+    }
+  };
 
   try {
     for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
@@ -357,6 +368,7 @@ export async function runChunkedParseAndResolve(
         // Cache hit: replay the cached worker output through the same
         // merge logic the live worker path uses.
         chunkCacheHits++;
+        captureFileArtifacts(cachedRaw);
         chunkWorkerData = mergeChunkResults(graph, symbolTable, cachedRaw);
         if (isDev) {
           logger.info(
@@ -412,6 +424,7 @@ export async function runChunkedParseAndResolve(
         // small repos without worker pool simply don't cache. That's fine.
         if (parseCache && chunkHash && rawResults.length > 0) {
           parseCache.entries.set(chunkHash, rawResults);
+          captureFileArtifacts(rawResults);
           if (isDev) {
             logger.info(
               `📦 parse-cache MISS+store: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files, ${chunkHash.slice(0, 8)})`,
@@ -759,5 +772,8 @@ export async function runChunkedParseAndResolve(
     parseCacheMisses: chunkCacheMisses,
     parsedFilesCount: liveParsedFiles,
     replayedFiles: 0,
+    fileParseArtifacts: [...fileParseArtifacts.values()].sort((a, b) =>
+      a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0,
+    ),
   };
 }

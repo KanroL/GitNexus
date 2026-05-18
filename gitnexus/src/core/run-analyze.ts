@@ -43,6 +43,10 @@ import { deriveIncrementalWriteSet } from './incremental/write-set.js';
 import { validateIncrementalGraphConsistency } from './incremental/validation.js';
 import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
+  pruneFileArtifactCache,
+  saveFileParseArtifact,
+} from '../storage/file-artifact-cache.js';
+import {
   getCurrentCommit,
   getRemoteUrl,
   hasGitDir,
@@ -112,6 +116,11 @@ export interface AnalyzeOptions {
    * of a pipeline re-index.
    */
   allowDuplicateName?: boolean;
+  /** @internal Test-only worker threshold override forwarded to the ingestion pipeline. */
+  workerThresholdsForTest?: {
+    minFiles?: number;
+    minBytes?: number;
+  };
 }
 
 export interface AnalyzeResult {
@@ -452,7 +461,7 @@ export async function runFullAnalysis(
         : p.message || phaseLabel;
       progress(p.phase, scaled, message);
     },
-    { parseCache },
+    { parseCache, workerThresholdsForTest: options.workerThresholdsForTest },
   );
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
@@ -848,6 +857,30 @@ export async function runFullAnalysis(
       await saveParseCache(storagePath, parseCache);
     } catch (e) {
       log(`Warning: could not save parse cache (${(e as Error).message}); continuing.`);
+    }
+
+    // Persist worker-equivalent per-file parse artifacts for a future
+    // changed-file-only parse path. Nothing consumes these artifacts yet, so
+    // cache write/prune failures must never affect graph output or metadata.
+    try {
+      const artifacts = pipelineResult.fileParseArtifacts ?? [];
+      for (const artifact of artifacts) {
+        const contentHash = newFileHashes.get(artifact.filePath);
+        if (!contentHash) continue;
+        await saveFileParseArtifact(storagePath, {
+          filePath: artifact.filePath,
+          contentHash,
+          language: artifact.language,
+          parserKey: artifact.parserKey,
+          payload: artifact.payload,
+        });
+      }
+      const pruned = await pruneFileArtifactCache(storagePath, newFileHashes);
+      if (pruned > 0) {
+        log(`File artifact cache: pruned ${pruned} stale artifact(s)`);
+      }
+    } catch (e) {
+      log(`Warning: could not save file artifact cache (${(e as Error).message}); continuing.`);
     }
 
     // Forward the --name alias and the registry-collision bypass bit.

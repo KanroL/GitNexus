@@ -1,6 +1,7 @@
 import type { KnowledgeGraph } from '../core/graph/types.js';
 import { CommunityDetectionResult } from '../core/ingestion/community-processor.js';
 import { ProcessDetectionResult } from '../core/ingestion/process-processor.js';
+import type { CapturedFileParseArtifact } from '../storage/file-artifact-cache.js';
 
 // CLI-specific: in-memory result with graph + detection results
 export interface PipelineResult {
@@ -27,4 +28,6 @@ export interface PipelineResult {
     /** Reserved for the future file-artifact replay path; always 0 today. */
     replayedFiles: number;
   };
+  /** Worker-equivalent per-file artifacts captured for optional cache persistence. */
+  fileParseArtifacts: readonly CapturedFileParseArtifact[];
 }

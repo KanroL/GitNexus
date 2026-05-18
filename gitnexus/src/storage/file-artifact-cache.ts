@@ -62,6 +62,13 @@ export interface SaveFileParseArtifactInput {
   payload: ParseWorkerResult;
 }
 
+export interface CapturedFileParseArtifact {
+  filePath: string;
+  language?: SupportedLanguages | string;
+  parserKey?: string;
+  payload: ParseWorkerResult;
+}
+
 export interface LoadFileParseArtifactInput {
   filePath: string;
   contentHash: string;
@@ -167,6 +174,127 @@ const isParseWorkerResult = (value: unknown): value is ParseWorkerResult => {
     v.skippedLanguages !== null &&
     typeof v.fileCount === 'number'
   );
+};
+
+const emptyParseWorkerResult = (): ParseWorkerResult => ({
+  nodes: [],
+  relationships: [],
+  symbols: [],
+  imports: [],
+  calls: [],
+  assignments: [],
+  heritage: [],
+  routes: [],
+  fetchCalls: [],
+  decoratorRoutes: [],
+  toolDefs: [],
+  ormQueries: [],
+  constructorBindings: [],
+  fileScopeBindings: [],
+  parsedFiles: [],
+  skippedLanguages: {},
+  fileCount: 0,
+});
+
+const ensureSplitPayload = (
+  byFile: Map<string, ParseWorkerResult>,
+  filePath: string,
+): ParseWorkerResult => {
+  let payload = byFile.get(filePath);
+  if (!payload) {
+    payload = emptyParseWorkerResult();
+    byFile.set(filePath, payload);
+  }
+  return payload;
+};
+
+const filePathFromNode = (node: ParseWorkerResult['nodes'][number]): string | undefined => {
+  const filePath = node.properties?.filePath;
+  return typeof filePath === 'string' && filePath.length > 0 ? filePath : undefined;
+};
+
+const filePathForEndpoint = (
+  nodeFilePaths: ReadonlyMap<string, string>,
+  endpointId: string,
+): string | undefined => {
+  const nodeFilePath = nodeFilePaths.get(endpointId);
+  if (nodeFilePath !== undefined) return nodeFilePath;
+  return endpointId.startsWith('File:') ? endpointId.slice('File:'.length) : undefined;
+};
+
+const pushByFilePath = <T extends { filePath: string }>(
+  byFile: Map<string, ParseWorkerResult>,
+  items: readonly T[],
+  push: (payload: ParseWorkerResult, item: T) => void,
+): void => {
+  for (const item of items) {
+    if (typeof item.filePath !== 'string' || item.filePath.length === 0) continue;
+    push(ensureSplitPayload(byFile, item.filePath), item);
+  }
+};
+
+/**
+ * Split worker-batch output into worker-equivalent per-file artifacts.
+ *
+ * Relationships are retained only when both endpoints resolve to the same file.
+ * Cross-file relationships are intentionally skipped because replay will rebuild
+ * global import/call/heritage edges from extracted per-file seeds.
+ */
+export const splitParseWorkerResultsByFile = (
+  results: readonly ParseWorkerResult[],
+): CapturedFileParseArtifact[] => {
+  const byFile = new Map<string, ParseWorkerResult>();
+
+  for (const result of results) {
+    const nodeFilePaths = new Map<string, string>();
+    for (const node of result.nodes) {
+      const filePath = filePathFromNode(node);
+      if (!filePath) continue;
+      nodeFilePaths.set(node.id, filePath);
+      ensureSplitPayload(byFile, filePath).nodes.push(node);
+    }
+
+    for (const relationship of result.relationships) {
+      const sourceFile = filePathForEndpoint(nodeFilePaths, relationship.sourceId);
+      const targetFile = filePathForEndpoint(nodeFilePaths, relationship.targetId);
+      if (!sourceFile || sourceFile !== targetFile) continue;
+      ensureSplitPayload(byFile, sourceFile).relationships.push(relationship);
+    }
+
+    pushByFilePath(byFile, result.symbols, (payload, item) => payload.symbols.push(item));
+    pushByFilePath(byFile, result.imports, (payload, item) => payload.imports.push(item));
+    pushByFilePath(byFile, result.calls, (payload, item) => payload.calls.push(item));
+    pushByFilePath(byFile, result.assignments, (payload, item) => payload.assignments.push(item));
+    pushByFilePath(byFile, result.heritage, (payload, item) => payload.heritage.push(item));
+    pushByFilePath(byFile, result.routes, (payload, item) => payload.routes.push(item));
+    pushByFilePath(byFile, result.fetchCalls, (payload, item) => payload.fetchCalls.push(item));
+    pushByFilePath(byFile, result.decoratorRoutes, (payload, item) =>
+      payload.decoratorRoutes.push(item),
+    );
+    pushByFilePath(byFile, result.toolDefs, (payload, item) => payload.toolDefs.push(item));
+    pushByFilePath(byFile, result.ormQueries, (payload, item) => payload.ormQueries.push(item));
+    pushByFilePath(byFile, result.constructorBindings, (payload, item) =>
+      payload.constructorBindings.push(item),
+    );
+    pushByFilePath(byFile, result.fileScopeBindings, (payload, item) =>
+      payload.fileScopeBindings.push(item),
+    );
+    pushByFilePath(byFile, result.parsedFiles, (payload, item) => payload.parsedFiles.push(item));
+
+    // `skippedLanguages` is batch-level and does not identify specific files,
+    // so it cannot be safely assigned to a per-file artifact during splitting.
+  }
+
+  return [...byFile.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([filePath, payload]) => ({
+      filePath,
+      language: payload.nodes[0]?.properties.language,
+      payload: {
+        ...payload,
+        fileCount: 1,
+      },
+    }));
 };
 
 const isFileParseArtifact = (value: unknown): value is FileParseArtifact => {

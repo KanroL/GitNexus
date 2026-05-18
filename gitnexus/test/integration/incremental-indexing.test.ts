@@ -326,6 +326,35 @@ describe('incremental indexing integration', () => {
     }
   }, 600_000);
 
+  it('derives the verbose incremental plan before the pipeline starts', async () => {
+    const repo = await setupRepo();
+    const previousVerbose = process.env.GITNEXUS_VERBOSE;
+    try {
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"changed-fixture"}\n');
+
+      process.env.GITNEXUS_VERBOSE = '1';
+      const events: string[] = [];
+      await runFullAnalysis(repo.dbPath, analyzeOptions, {
+        onProgress: (phase) => events.push(`progress:${phase}`),
+        onLog: (message) => events.push(`log:${message}`),
+      });
+
+      const planIndex = events.findIndex((event) =>
+        event.includes('Incremental plan: mode=full reason=critical config file changed'),
+      );
+      const pipelineStartIndex = events.findIndex((event) => event === 'progress:extracting');
+
+      expect(planIndex).toBeGreaterThanOrEqual(0);
+      expect(pipelineStartIndex).toBeGreaterThanOrEqual(0);
+      expect(planIndex).toBeLessThan(pipelineStartIndex);
+    } finally {
+      if (previousVerbose === undefined) delete process.env.GITNEXUS_VERBOSE;
+      else process.env.GITNEXUS_VERBOSE = previousVerbose;
+      await repo.cleanup();
+    }
+  }, 600_000);
+
   it('status reports added, modified, and deleted counts before indexing', async () => {
     const repo = await setupRepo();
     try {

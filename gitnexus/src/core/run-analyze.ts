@@ -401,6 +401,46 @@ export async function runFullAnalysis(
   // in-place (cache hits leave entries unchanged; misses add new ones).
   const parseCache = await loadParseCache(storagePath);
 
+  // Compute current per-file content hashes from the same repository scan that
+  // `gitnexus status` uses. Deriving hashes from graph File nodes let analyze
+  // and status drift whenever generated files or non-symbol files were present.
+  // `computeFileHashes` applies the shared generated-file filter while keeping
+  // real source/config files such as package.json tracked.
+  //
+  // Phase 2 incremental optimization: derive this plan before the full
+  // in-memory pipeline. The pipeline still runs unchanged for now; later
+  // phases will use this early plan to decide which artifacts can be replayed.
+  const hashStart = Date.now();
+  const scannedFilePaths = (await walkRepositoryPaths(repoPath)).map((f) => f.path);
+  const newFileHashes = await computeFileHashes(repoPath, scannedFilePaths);
+  profile.hashMs = Date.now() - hashStart;
+  const allFilePaths = [...newFileHashes.keys()];
+
+  const planningStart = Date.now();
+  const incrementalPlan = deriveIncrementalPlan({
+    // Dirty recovery sets options.force above to preserve embedding behavior,
+    // but the planner should still surface "dirty recovery" instead of the
+    // generic forced-rebuild reason.
+    force: dirtyRecovery ? false : options.force,
+    existingMeta,
+    repoHasGit,
+    allFilePaths,
+    currentFileHashes: newFileHashes,
+  });
+  profile.incrementalPlanningMs = Date.now() - planningStart;
+  const isIncremental = incrementalPlan.mode === 'incremental';
+  const hashDiff = isIncremental ? incrementalPlan.hashDiff : undefined;
+
+  if (isAnalyzeProfilingEnabled()) {
+    if (isIncremental && hashDiff) {
+      log(
+        `Incremental plan: mode=incremental changed=${hashDiff.changed.length}, added=${hashDiff.added.length}, deleted=${hashDiff.deleted.length}`,
+      );
+    } else if (incrementalPlan.mode === 'full') {
+      log(`Incremental plan: mode=full reason=${incrementalPlan.reason}`);
+    }
+  }
+
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
   const pipelineResult = await runPipelineFromRepo(
     repoPath,
@@ -417,38 +457,6 @@ export async function runFullAnalysis(
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB...');
-
-  // Compute current per-file content hashes from the same repository scan that
-  // `gitnexus status` uses. Deriving hashes from graph File nodes let analyze
-  // and status drift whenever generated files or non-symbol files were present.
-  // `computeFileHashes` applies the shared generated-file filter while keeping
-  // real source/config files such as package.json tracked.
-  const hashStart = Date.now();
-  const scannedFilePaths = (await walkRepositoryPaths(repoPath)).map((f) => f.path);
-  const newFileHashes = await computeFileHashes(repoPath, scannedFilePaths);
-  profile.hashMs = Date.now() - hashStart;
-  const allFilePaths = [...newFileHashes.keys()];
-
-  // Decide incremental vs full at THIS point (post-pipeline, pre-DB).
-  // All eligibility conditions are checked here against the actual
-  // pipeline output — no separate pre-pipeline prediction to desync from
-  // (Bugbot review on PR #1479: a prediction that flipped post-pipeline
-  // could skip the embedding cache load and then take the full-rebuild
-  // path, silently losing embeddings).
-  const planningStart = Date.now();
-  const incrementalPlan = deriveIncrementalPlan({
-    // Dirty recovery sets options.force above to preserve embedding behavior,
-    // but the planner should still surface "dirty recovery" instead of the
-    // generic forced-rebuild reason.
-    force: dirtyRecovery ? false : options.force,
-    existingMeta,
-    repoHasGit,
-    allFilePaths,
-    currentFileHashes: newFileHashes,
-  });
-  profile.incrementalPlanningMs = Date.now() - planningStart;
-  const isIncremental = incrementalPlan.mode === 'incremental';
-  const hashDiff = isIncremental ? incrementalPlan.hashDiff : undefined;
 
   const dbWritebackStart = Date.now();
 

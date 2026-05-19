@@ -528,6 +528,7 @@ export async function runFullAnalysis(
             fileArtifactReplay: {
               storagePath,
               currentFileHashes: newFileHashes,
+              priorFileHashes: existingMeta?.fileHashes,
               freshFiles: incrementalFreshFiles,
               stats: fileArtifactReplayStats,
             },

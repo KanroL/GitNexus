@@ -102,6 +102,28 @@ type ScannedFile = { path: string; size: number };
 type ParseChunk = { paths: string[]; replayRaw?: ParseWorkerResult[] };
 type ProgressFn = (progress: PipelineProgress) => void;
 
+export const splitFreshAndReplayFiles = (
+  parseableScanned: readonly ScannedFile[],
+  replay: {
+    currentFileHashes: ReadonlyMap<string, string>;
+    priorFileHashes?: Readonly<Record<string, string>>;
+    freshFiles: ReadonlySet<string>;
+  },
+): { freshCandidates: ScannedFile[]; replayCandidates: ScannedFile[] } => {
+  const replayCandidates: ScannedFile[] = [];
+  const freshCandidates: ScannedFile[] = [];
+  for (const file of parseableScanned) {
+    const currentHash = replay.currentFileHashes.get(file.path);
+    const priorHash = replay.priorFileHashes?.[file.path];
+    if (replay.freshFiles.has(file.path) || !currentHash || !priorHash || currentHash !== priorHash) {
+      freshCandidates.push(file);
+    } else {
+      replayCandidates.push(file);
+    }
+  }
+  return { freshCandidates, replayCandidates };
+};
+
 /**
  * Chunked parse + resolve loop.
  *
@@ -199,8 +221,7 @@ export async function runChunkedParseAndResolve(
 
   if (options?.fileArtifactReplay && totalParseable > 0) {
     const replay = options.fileArtifactReplay;
-    const replayCandidates = parseableScanned.filter((f) => !replay.freshFiles.has(f.path));
-    const freshCandidates = parseableScanned.filter((f) => replay.freshFiles.has(f.path));
+    const { freshCandidates, replayCandidates } = splitFreshAndReplayFiles(parseableScanned, replay);
     const replayRaw: ParseWorkerResult[] = [];
     let disabledReason: string | undefined;
 

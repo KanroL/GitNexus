@@ -76,6 +76,7 @@ export interface PipelineOptions {
   fileArtifactReplay?: {
     storagePath: string;
     currentFileHashes: ReadonlyMap<string, string>;
+    priorFileHashes?: Readonly<Record<string, string>>;
     freshFiles: ReadonlySet<string>;
     stats: FileArtifactReplayStats;
   };

@@ -171,17 +171,46 @@ const escapeCypherLabel = (value: string): string => `\`${value.replace(/`/g, '`
 const firstCount = (rows: any[]): number => Number(rows?.[0]?.cnt ?? rows?.[0]?.[0] ?? 0);
 
 interface AnalyzeProfileTimings {
+  preflightMs: number;
+  embeddingCacheLoadMs: number;
+  parseCacheLoadMs: number;
   scanMs: number;
+  structureMs: number;
+  markdownMs: number;
+  cobolMs: number;
   hashMs: number;
   incrementalPlanningMs: number;
+  importerExpansionMs: number;
+  pipelineMs: number;
   parseExtractMs: number;
-  graphAssemblyMs: number;
+  routesMs: number;
+  toolsMs: number;
+  ormMs: number;
   crossFileMs: number;
+  scopeResolutionMs: number;
+  mroMs: number;
   communitiesMs: number;
   processesMs: number;
   dbWritebackMs: number;
+  lbugInitMs: number;
+  dirtyMetaMs: number;
+  fullWipeMs: number;
+  writeSetPlanningMs: number;
+  deleteRowsMs: number;
+  deleteGraphWideMs: number;
+  subgraphExtractMs: number;
+  graphLoadMs: number;
   validationMs: number;
+  ftsMs: number;
+  embeddingRestoreMs: number;
+  embeddingGenerateMs: number;
   checkpointReopenMs: number;
+  metadataMs: number;
+  cacheSaveMs: number;
+  fileArtifactSaveMs: number;
+  registryMs: number;
+  contextFilesMs: number;
+  finalCloseMs: number;
   totalAnalyzeMs: number;
 }
 
@@ -198,10 +227,26 @@ interface AnalyzeProfileCounters {
 
 export const isAnalyzeProfilingEnabled = (): boolean => process.env.GITNEXUS_VERBOSE === '1';
 
-const sumTimings = (timings: Record<string, number>, phaseNames: readonly string[]): number =>
-  phaseNames.reduce((total, name) => total + (timings[name] ?? 0), 0);
-
 const formatMs = (ms: number): string => `${Math.max(0, Math.round(ms))}ms`;
+
+const sumProfileMajorTimings = (timings: AnalyzeProfileTimings): number =>
+  timings.preflightMs +
+  timings.embeddingCacheLoadMs +
+  timings.parseCacheLoadMs +
+  timings.hashMs +
+  timings.incrementalPlanningMs +
+  timings.importerExpansionMs +
+  timings.pipelineMs +
+  timings.dbWritebackMs +
+  timings.ftsMs +
+  timings.embeddingRestoreMs +
+  timings.embeddingGenerateMs +
+  timings.checkpointReopenMs +
+  timings.metadataMs +
+  timings.cacheSaveMs +
+  timings.fileArtifactSaveMs +
+  timings.registryMs +
+  timings.contextFilesMs;
 
 export const formatAnalyzeProfileLog = (
   timings: AnalyzeProfileTimings,
@@ -209,8 +254,10 @@ export const formatAnalyzeProfileLog = (
 ): string[] => [
   'Analyze profile:',
   `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, artifactReplay=${counters.artifactReplayEnabled ? 'enabled' : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}`,
-  `  pipeline: scan=${formatMs(timings.scanMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, graphAssembly=${formatMs(timings.graphAssemblyMs)}, crossFile=${formatMs(timings.crossFileMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
-  `  orchestration: hash=${formatMs(timings.hashMs)}, incrementalPlanning=${formatMs(timings.incrementalPlanningMs)}, dbWriteback=${formatMs(timings.dbWritebackMs)}, validation=${formatMs(timings.validationMs)}, checkpointReopen=${formatMs(timings.checkpointReopenMs)}, total=${formatMs(timings.totalAnalyzeMs)}`,
+  `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
+  `  db: writeback=${formatMs(timings.dbWritebackMs)}, init=${formatMs(timings.lbugInitMs)}, close=${formatMs(timings.finalCloseMs)}, dirtyMeta=${formatMs(timings.dirtyMetaMs)}, fullWipe=${formatMs(timings.fullWipeMs)}, writeSetPlanning=${formatMs(timings.writeSetPlanningMs)}, deleteRows=${formatMs(timings.deleteRowsMs)}, deleteGraphWide=${formatMs(timings.deleteGraphWideMs)}, subgraphExtract=${formatMs(timings.subgraphExtractMs)}, graphLoad=${formatMs(timings.graphLoadMs)}, validation=${formatMs(timings.validationMs)}, checkpointReopen=${formatMs(timings.checkpointReopenMs)}`,
+  `  postDb: fts=${formatMs(timings.ftsMs)}, embeddingCacheLoad=${formatMs(timings.embeddingCacheLoadMs)}, embeddingRestore=${formatMs(timings.embeddingRestoreMs)}, embeddingGenerate=${formatMs(timings.embeddingGenerateMs)}, metadata=${formatMs(timings.metadataMs)}, cacheSave=${formatMs(timings.cacheSaveMs)}, fileArtifactSave=${formatMs(timings.fileArtifactSaveMs)}, registry=${formatMs(timings.registryMs)}, contextFiles=${formatMs(timings.contextFilesMs)}`,
+  `  orchestration: preflight=${formatMs(timings.preflightMs)}, parseCacheLoad=${formatMs(timings.parseCacheLoadMs)}, hash=${formatMs(timings.hashMs)}, incrementalPlanning=${formatMs(timings.incrementalPlanningMs)}, importerExpansion=${formatMs(timings.importerExpansionMs)}, accounted=${formatMs(sumProfileMajorTimings(timings))}, unaccounted=${formatMs(timings.totalAnalyzeMs - sumProfileMajorTimings(timings))}, total=${formatMs(timings.totalAnalyzeMs)}`,
 ];
 
 // ---------------------------------------------------------------------------
@@ -238,15 +285,38 @@ export async function runFullAnalysis(
   const progress = (phase: string, percent: number, message: string) =>
     callbacks.onProgress(phase, percent, message);
   const profile = {
+    preflightMs: 0,
+    embeddingCacheLoadMs: 0,
+    parseCacheLoadMs: 0,
     hashMs: 0,
     incrementalPlanningMs: 0,
+    importerExpansionMs: 0,
+    pipelineMs: 0,
     dbWritebackMs: 0,
+    lbugInitMs: 0,
+    dirtyMetaMs: 0,
+    fullWipeMs: 0,
+    writeSetPlanningMs: 0,
+    deleteRowsMs: 0,
+    deleteGraphWideMs: 0,
+    subgraphExtractMs: 0,
+    graphLoadMs: 0,
     validationMs: 0,
+    ftsMs: 0,
+    embeddingRestoreMs: 0,
+    embeddingGenerateMs: 0,
     checkpointReopenMs: 0,
+    metadataMs: 0,
+    cacheSaveMs: 0,
+    fileArtifactSaveMs: 0,
+    registryMs: 0,
+    contextFilesMs: 0,
+    finalCloseMs: 0,
   };
 
   const { storagePath, lbugPath } = getStoragePaths(repoPath);
 
+  const preflightStart = Date.now();
   // Clean up stale KuzuDB files from before the LadybugDB migration.
   const kuzuResult = await cleanupOldKuzuFiles(storagePath);
   if (kuzuResult.found && kuzuResult.needsReindex) {
@@ -256,6 +326,7 @@ export async function runFullAnalysis(
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   const existingMeta = await loadMeta(storagePath);
+  profile.preflightMs += Date.now() - preflightStart;
 
   // Preserve the existing dirty-recovery behavior: downstream embedding
   // mode treats this as a forced rebuild, while the incremental planner
@@ -382,13 +453,18 @@ export async function runFullAnalysis(
   // step gates itself on the actual `isIncremental` value to avoid
   // PK-conflicts when the incremental writeback path keeps the rows.
   if (shouldLoadCache && existingMeta) {
+    const embeddingCacheLoadStart = Date.now();
     try {
       progress('embeddings', 0, 'Caching embeddings...');
+      const initStart = Date.now();
       await initLbug(lbugPath);
+      profile.lbugInitMs += Date.now() - initStart;
       const cached = await loadCachedEmbeddings();
       cachedEmbeddingNodeIds = cached.embeddingNodeIds;
       cachedEmbeddings = cached.embeddings;
+      const closeStart = Date.now();
       await closeLbug();
+      profile.finalCloseMs += Date.now() - closeStart;
     } catch (err: any) {
       // Surface cache-load failures explicitly: silently swallowing here would
       // re-introduce the original silent-data-loss symptom (embeddings end up
@@ -401,10 +477,14 @@ export async function runFullAnalysis(
       cachedEmbeddingNodeIds = new Set<string>();
       cachedEmbeddings = [];
       try {
+        const closeStart = Date.now();
         await closeLbug();
+        profile.finalCloseMs += Date.now() - closeStart;
       } catch {
         /* swallow */
       }
+    } finally {
+      profile.embeddingCacheLoadMs += Date.now() - embeddingCacheLoadStart;
     }
   }
 
@@ -413,7 +493,9 @@ export async function runFullAnalysis(
   // file contents haven't changed produce identical worker output).
   // Loaded into a single ParseCache object that the pipeline mutates
   // in-place (cache hits leave entries unchanged; misses add new ones).
+  const parseCacheLoadStart = Date.now();
   const parseCache = await loadParseCache(storagePath);
+  profile.parseCacheLoadMs = Date.now() - parseCacheLoadStart;
 
   // Compute current per-file content hashes from the same repository scan that
   // `gitnexus status` uses. Deriving hashes from graph File nodes let analyze
@@ -466,6 +548,7 @@ export async function runFullAnalysis(
 
   let incrementalFreshFiles: Set<string> | undefined;
   if (isIncremental && hashDiff) {
+    const importerExpansionStart = Date.now();
     incrementalFreshFiles = new Set(hashDiff.toWrite);
     const priorFileSet = new Set(existingMeta?.fileHashes ? Object.keys(existingMeta.fileHashes) : []);
     const shadowCandidates: string[] = [];
@@ -479,7 +562,9 @@ export async function runFullAnalysis(
     }
 
     try {
+      const initStart = Date.now();
       await initLbug(lbugPath);
+      profile.lbugInitMs += Date.now() - initStart;
       const seenFrontier = new Set<string>();
       let frontier = [...hashDiff.toWrite, ...hashDiff.deleted, ...shadowCandidates];
       for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
@@ -505,11 +590,15 @@ export async function runFullAnalysis(
       fileArtifactReplayStats.artifactReplayDisabledReason = `importer expansion failed: ${(err as Error).message}`;
       incrementalFreshFiles = undefined;
     } finally {
+      const closeStart = Date.now();
       await closeLbug();
+      profile.finalCloseMs += Date.now() - closeStart;
+      profile.importerExpansionMs += Date.now() - importerExpansionStart;
     }
   }
 
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
+  const pipelineStart = Date.now();
   const pipelineResult = await runPipelineFromRepo(
     repoPath,
     (p) => {
@@ -536,6 +625,7 @@ export async function runFullAnalysis(
         : {}),
     },
   );
+  profile.pipelineMs = Date.now() - pipelineStart;
 
   if (isAnalyzeProfilingEnabled()) {
     const reason = pipelineResult.parseStats.artifactReplayEnabled
@@ -562,6 +652,7 @@ export async function runFullAnalysis(
     );
     // Set the dirty flag BEFORE any destructive DB mutation. Cleared on
     // success at the meta-save step.
+    const dirtyMetaStart = Date.now();
     await saveMeta(storagePath, {
       ...existingMeta!,
       incrementalInProgress: {
@@ -569,12 +660,16 @@ export async function runFullAnalysis(
         toWriteCount: hashDiff.toWrite.length,
       },
     });
+    profile.dirtyMetaMs += Date.now() - dirtyMetaStart;
   } else {
     if (incrementalPlan.mode === 'full') {
       log(`Incremental fallback: ${incrementalPlan.reason}`);
     }
     // Full rebuild path: wipe DB files first.
+    const fullWipeStart = Date.now();
+    const closeStart = Date.now();
     await closeLbug();
+    profile.finalCloseMs += Date.now() - closeStart;
     const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
     for (const f of lbugFiles) {
       try {
@@ -583,9 +678,12 @@ export async function runFullAnalysis(
         /* swallow */
       }
     }
+    profile.fullWipeMs += Date.now() - fullWipeStart;
   }
 
+  const initStart = Date.now();
   await initLbug(lbugPath);
+  profile.lbugInitMs += Date.now() - initStart;
   try {
     // All work after initLbug is wrapped in try/finally to ensure closeLbug()
     // is called even if an error occurs — the module-level singleton DB handle
@@ -593,16 +691,21 @@ export async function runFullAnalysis(
 
     let lbugMsgCount = 0;
     if (isIncremental && hashDiff) {
+      const writeSetPlanningStart = Date.now();
       const writeSetPlan = await deriveIncrementalWriteSet({
         hashDiff,
         fullGraph: pipelineResult.graph,
         priorFileHashes: existingMeta?.fileHashes,
         queryImporters,
       });
+      profile.writeSetPlanningMs += Date.now() - writeSetPlanningStart;
 
       if (writeSetPlan.mode === 'full') {
         log(`Incremental fallback: ${writeSetPlan.reason}`);
+        const fallbackWipeStart = Date.now();
+        const closeStart = Date.now();
         await closeLbug();
+        profile.finalCloseMs += Date.now() - closeStart;
         const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
         for (const f of lbugFiles) {
           try {
@@ -611,12 +714,17 @@ export async function runFullAnalysis(
             /* swallow */
           }
         }
+        profile.fullWipeMs += Date.now() - fallbackWipeStart;
+        const initStart = Date.now();
         await initLbug(lbugPath);
+        profile.lbugInitMs += Date.now() - initStart;
+        const graphLoadStart = Date.now();
         await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
           lbugMsgCount++;
           const pct = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
           progress('lbug', pct, msg);
         });
+        profile.graphLoadMs += Date.now() - graphLoadStart;
       } else {
         if (writeSetPlan.diagnostics.importerExpansionSize > 0) {
           log(
@@ -630,6 +738,7 @@ export async function runFullAnalysis(
         }
 
         const { effectiveWriteSet, filesToDelete } = writeSetPlan;
+        const deleteRowsStart = Date.now();
         for (let i = 0; i < filesToDelete.length; i++) {
           const f = filesToDelete[i];
           try {
@@ -641,21 +750,28 @@ export async function runFullAnalysis(
             progress('lbug', 62, `Removing rows for changed files (${i}/${filesToDelete.length})...`);
           }
         }
+        profile.deleteRowsMs += Date.now() - deleteRowsStart;
         // 2. Drop graph-wide nodes (Community, Process). They'll be re-inserted
         //    from the fresh pipeline output below. Required for the
         //    "Leiden runs on the FULL graph" correctness invariant.
+        const deleteGraphWideStart = Date.now();
         await deleteAllCommunitiesAndProcesses();
+        profile.deleteGraphWideMs += Date.now() - deleteGraphWideStart;
 
         // 3. Extract the changed subgraph from the FULL ctx.graph and write
         //    only that. Unchanged-file rows in the DB stay untouched. Pass
         //    the SAME effectiveWriteSet so the subgraph and the deletes
         //    cover identical files (asymmetry would silently corrupt).
+        const subgraphExtractStart = Date.now();
         const subgraph = extractChangedSubgraph(pipelineResult.graph, effectiveWriteSet);
+        profile.subgraphExtractMs += Date.now() - subgraphExtractStart;
+        const graphLoadStart = Date.now();
         await loadGraphToLbug(subgraph, pipelineResult.repoPath, storagePath, (msg) => {
           lbugMsgCount++;
           const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
           progress('lbug', pct, msg);
         });
+        profile.graphLoadMs += Date.now() - graphLoadStart;
 
         const validationStart = Date.now();
         const validation = await validateIncrementalGraphConsistency({
@@ -693,17 +809,21 @@ export async function runFullAnalysis(
       }
     } else {
       // ── Full rebuild ───────────────────────────────────────────────
+      const graphLoadStart = Date.now();
       await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
         lbugMsgCount++;
         const pct = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
         progress('lbug', pct, msg);
       });
+      profile.graphLoadMs += Date.now() - graphLoadStart;
     }
     profile.dbWritebackMs = Date.now() - dbWritebackStart - profile.validationMs;
 
     // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
     progress('fts', 85, 'Creating search indexes...');
+    const ftsStart = Date.now();
     await createSearchFTSIndexes();
+    profile.ftsMs += Date.now() - ftsStart;
     progress('fts', 90, 'Search indexes ready');
 
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
@@ -721,6 +841,7 @@ export async function runFullAnalysis(
     //                   flagged that gating this on `!isIncremental`
     //                   silently lost changed-file embeddings.
     if (cachedEmbeddings.length > 0) {
+      const embeddingRestoreStart = Date.now();
       const cachedDims = cachedEmbeddings[0].embedding.length;
       const { EMBEDDING_DIMS } = await import('./lbug/schema.js');
       if (cachedDims !== EMBEDDING_DIMS) {
@@ -745,6 +866,7 @@ export async function runFullAnalysis(
           }
         }
       }
+      profile.embeddingRestoreMs += Date.now() - embeddingRestoreStart;
     }
 
     // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
@@ -778,6 +900,7 @@ export async function runFullAnalysis(
     }
 
     if (!embeddingSkipped) {
+      const embeddingGenerateStart = Date.now();
       const { isHttpMode } = await import('./embeddings/http-client.js');
       const httpMode = isHttpMode();
       progress(
@@ -837,6 +960,7 @@ export async function runFullAnalysis(
       } else {
         semanticMode = 'vector-index';
       }
+      profile.embeddingGenerateMs += Date.now() - embeddingGenerateStart;
     }
 
     // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
@@ -847,12 +971,17 @@ export async function runFullAnalysis(
     // prevents a successful incremental analyze from publishing clean metadata
     // while leaving a WAL state that `gitnexus serve` cannot open.
     const checkpointReopenStart = Date.now();
+    const closeStart = Date.now();
     await closeLbug();
+    profile.finalCloseMs += Date.now() - closeStart;
+    const reopenStart = Date.now();
     await initLbug(lbugPath);
+    profile.lbugInitMs += Date.now() - reopenStart;
     profile.checkpointReopenMs = Date.now() - checkpointReopenStart;
 
     progress('done', 98, 'Saving metadata...');
 
+    const metadataStart = Date.now();
     const stats = await getLbugStats();
 
     // Count embeddings in the index (cached + newly generated)
@@ -923,6 +1052,7 @@ export async function runFullAnalysis(
       incrementalInProgress: undefined as { startedAt: number; toWriteCount: number } | undefined,
     };
     await saveMeta(storagePath, meta);
+    profile.metadataMs += Date.now() - metadataStart;
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise
@@ -932,11 +1062,13 @@ export async function runFullAnalysis(
     // dead weight; the parse phase populates `usedKeys` as it processes
     // chunks).
     try {
+      const cacheSaveStart = Date.now();
       const pruned = pruneCache(parseCache, parseCache.usedKeys);
       if (pruned > 0) {
         log(`Parse cache: pruned ${pruned} stale chunk entries`);
       }
       await saveParseCache(storagePath, parseCache);
+      profile.cacheSaveMs += Date.now() - cacheSaveStart;
     } catch (e) {
       log(`Warning: could not save parse cache (${(e as Error).message}); continuing.`);
     }
@@ -945,6 +1077,7 @@ export async function runFullAnalysis(
     // changed-file-only parse path. Nothing consumes these artifacts yet, so
     // cache write/prune failures must never affect graph output or metadata.
     try {
+      const fileArtifactSaveStart = Date.now();
       const artifacts = pipelineResult.fileParseArtifacts ?? [];
       for (const artifact of artifacts) {
         const contentHash = newFileHashes.get(artifact.filePath);
@@ -961,6 +1094,7 @@ export async function runFullAnalysis(
       if (pruned > 0) {
         log(`File artifact cache: pruned ${pruned} stale artifact(s)`);
       }
+      profile.fileArtifactSaveMs += Date.now() - fileArtifactSaveStart;
     } catch (e) {
       log(`Warning: could not save file artifact cache (${(e as Error).message}); continuing.`);
     }
@@ -974,12 +1108,15 @@ export async function runFullAnalysis(
     // (after applying the precedence chain in registerRepo) — reuse it
     // so AGENTS.md / skill files reference the same name MCP clients
     // will look up (#979).
+    const registryStart = Date.now();
     const projectName = await registerRepo(repoPath, meta, {
       name: options.registryName,
       allowDuplicateName: options.allowDuplicateName,
     });
+    profile.registryMs += Date.now() - registryStart;
 
     // Keep generated .gitnexus contents ignored without editing the user's root .gitignore.
+    const contextStart = Date.now();
     await ensureGitNexusIgnored(repoPath);
 
     // ── Generate AI context files (best-effort) ───────────────────────
@@ -1016,33 +1153,57 @@ export async function runFullAnalysis(
     } catch {
       // Best-effort — don't fail the entire analysis for context file issues
     }
+    profile.contextFilesMs += Date.now() - contextStart;
 
     // ── Close LadybugDB ──────────────────────────────────────────────
+    const finalCloseStart = Date.now();
     await closeLbug();
+    profile.finalCloseMs += Date.now() - finalCloseStart;
 
     if (isAnalyzeProfilingEnabled()) {
       const phaseTimings = pipelineResult.phaseTimings ?? {};
       const profileLines = formatAnalyzeProfileLog(
         {
+          preflightMs: profile.preflightMs,
+          embeddingCacheLoadMs: profile.embeddingCacheLoadMs,
+          parseCacheLoadMs: profile.parseCacheLoadMs,
           scanMs: phaseTimings.scan ?? 0,
+          structureMs: phaseTimings.structure ?? 0,
+          markdownMs: phaseTimings.markdown ?? 0,
+          cobolMs: phaseTimings.cobol ?? 0,
           hashMs: profile.hashMs,
           incrementalPlanningMs: profile.incrementalPlanningMs,
+          importerExpansionMs: profile.importerExpansionMs,
+          pipelineMs: profile.pipelineMs,
           parseExtractMs: phaseTimings.parse ?? 0,
-          graphAssemblyMs: sumTimings(phaseTimings, [
-            'structure',
-            'markdown',
-            'cobol',
-            'routes',
-            'tools',
-            'orm',
-            'mro',
-          ]),
+          routesMs: phaseTimings.routes ?? 0,
+          toolsMs: phaseTimings.tools ?? 0,
+          ormMs: phaseTimings.orm ?? 0,
           crossFileMs: phaseTimings.crossFile ?? 0,
+          scopeResolutionMs: phaseTimings.scopeResolution ?? 0,
+          mroMs: phaseTimings.mro ?? 0,
           communitiesMs: phaseTimings.communities ?? 0,
           processesMs: phaseTimings.processes ?? 0,
           dbWritebackMs: profile.dbWritebackMs,
+          lbugInitMs: profile.lbugInitMs,
+          dirtyMetaMs: profile.dirtyMetaMs,
+          fullWipeMs: profile.fullWipeMs,
+          writeSetPlanningMs: profile.writeSetPlanningMs,
+          deleteRowsMs: profile.deleteRowsMs,
+          deleteGraphWideMs: profile.deleteGraphWideMs,
+          subgraphExtractMs: profile.subgraphExtractMs,
+          graphLoadMs: profile.graphLoadMs,
           validationMs: profile.validationMs,
+          ftsMs: profile.ftsMs,
+          embeddingRestoreMs: profile.embeddingRestoreMs,
+          embeddingGenerateMs: profile.embeddingGenerateMs,
           checkpointReopenMs: profile.checkpointReopenMs,
+          metadataMs: profile.metadataMs,
+          cacheSaveMs: profile.cacheSaveMs,
+          fileArtifactSaveMs: profile.fileArtifactSaveMs,
+          registryMs: profile.registryMs,
+          contextFilesMs: profile.contextFilesMs,
+          finalCloseMs: profile.finalCloseMs,
           totalAnalyzeMs: Date.now() - analyzeStart,
         },
         pipelineResult.parseStats ?? {

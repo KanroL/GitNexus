@@ -102,7 +102,7 @@ export interface ParseOutput {
   readonly parseCacheMisses: number;
   /** Number of files that went through live parse/extract work. */
   readonly parsedFilesCount: number;
-  /** Future file-artifact replay counter; intentionally 0 until that feature exists. */
+  /** Number of files replayed from per-file parse artifacts. */
   readonly replayedFiles: number;
   /** Worker-equivalent per-file artifacts captured for persistence after successful analyze. */
   readonly fileParseArtifacts: readonly CapturedFileParseArtifact[];

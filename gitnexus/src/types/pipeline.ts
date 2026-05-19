@@ -25,8 +25,11 @@ export interface PipelineResult {
     parseCacheHits: number;
     parseCacheMisses: number;
     parsedFiles: number;
-    /** Reserved for the future file-artifact replay path; always 0 today. */
+    fileArtifactHits: number;
+    fileArtifactMisses: number;
     replayedFiles: number;
+    artifactReplayEnabled: boolean;
+    artifactReplayDisabledReason?: string;
   };
   /** Worker-equivalent per-file artifacts captured for optional cache persistence. */
   fileParseArtifacts: readonly CapturedFileParseArtifact[];

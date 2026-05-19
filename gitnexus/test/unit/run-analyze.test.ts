@@ -44,13 +44,17 @@ describe('run-analyze module', () => {
         parseCacheHits: 13,
         parseCacheMisses: 14,
         parsedFiles: 15,
+        fileArtifactHits: 16,
+        fileArtifactMisses: 17,
         replayedFiles: 0,
+        artifactReplayEnabled: false,
+        artifactReplayDisabledReason: 'not incremental',
       },
     );
 
     expect(lines).toEqual([
       'Analyze profile:',
-      '  counters: parseCacheHits=13, parseCacheMisses=14, parsedFiles=15, replayedFiles=0',
+      '  counters: parseCacheHits=13, parseCacheMisses=14, parsedFiles=15, fileArtifactHits=16, fileArtifactMisses=17, replayedFiles=0, artifactReplay=disabled(not incremental)',
       '  pipeline: scan=1ms, parseExtract=4ms, graphAssembly=5ms, crossFile=6ms, communities=7ms, processes=8ms',
       '  orchestration: hash=2ms, incrementalPlanning=3ms, dbWriteback=9ms, validation=10ms, checkpointReopen=11ms, total=12ms',
     ]);

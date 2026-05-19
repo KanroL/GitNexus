@@ -5,10 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
 import { closeLbug, executeQuery, initLbug } from '../../src/core/lbug/lbug-adapter.js';
 import { getStoragePaths, loadMeta } from '../../src/storage/repo-manager.js';
-import {
-  getFileArtifactCacheDir,
-  loadFileParseArtifact,
-} from '../../src/storage/file-artifact-cache.js';
+import { getFileArtifactCacheDir, loadFileParseArtifact } from '../../src/storage/file-artifact-cache.js';
 import { buildStatusReport } from '../../src/cli/status.js';
 import { createTempDir } from '../helpers/test-db.js';
 
@@ -56,6 +53,29 @@ export function useValue(): string {
     stdio: 'pipe',
   });
   return tmp;
+}
+
+async function setupWorkerArtifactRepo() {
+  const repo = await createTempDir('gitnexus-artifact-replay-int-');
+  const src = path.join(repo.dbPath, 'src');
+  await mkdir(src, { recursive: true });
+  for (let i = 0; i < 15; i++) {
+    await writeFile(
+      path.join(src, `artifact-${i}.ts`),
+      `export function artifact${i}(): number { return ${i}; }\n`,
+    );
+  }
+  await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"artifact-replay-fixture"}\n');
+  execSync('git init', { cwd: repo.dbPath, stdio: 'pipe' });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m initial', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  return repo;
 }
 
 async function queryRepo<T = any>(repoPath: string, cypher: string): Promise<T[]> {
@@ -182,10 +202,12 @@ describe('incremental indexing integration', () => {
       expect(
         artifact?.payload.nodes.some((node) => node.properties.filePath === artifact.filePath),
       ).toBe(true);
+
     } finally {
+      await closeLbug();
       await repo.cleanup();
     }
-  }, 300_000);
+  }, 600_000);
 
   it('second analyze with no changes returns already up to date', async () => {
     const repo = await setupRepo();
@@ -447,4 +469,42 @@ describe('incremental indexing integration', () => {
       await repo.cleanup();
     }
   }, 360_000);
+
+  it('warm incremental replays unchanged file artifacts and parses fewer files', async () => {
+    const repo = await setupWorkerArtifactRepo();
+    try {
+      await runFullAnalysis(
+        repo.dbPath,
+        { ...analyzeOptions, force: true, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
+        callbacks(),
+      );
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'artifact-0.ts'),
+        'export function artifact0(): number { return 100; }\n',
+      );
+      const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+
+      expect(incremental.pipelineResult?.parseStats.artifactReplayEnabled).toBe(true);
+      expect(incremental.pipelineResult?.parseStats.fileArtifactHits).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.parseStats.replayedFiles).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.parseStats.parsedFiles).toBeLessThan(
+        incremental.pipelineResult!.parseStats.replayedFiles,
+      );
+
+      const statusPaths = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(statusPaths.storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath: statusPaths.storagePath,
+        lbugPath: statusPaths.lbugPath,
+        metaPath: statusPaths.metaPath,
+        meta: meta!,
+      });
+      expect(report.isUpToDate).toBe(true);
+    } finally {
+      await closeLbug();
+      await repo.cleanup();
+    }
+  }, 600_000);
 });

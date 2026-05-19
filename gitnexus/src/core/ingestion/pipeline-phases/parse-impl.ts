@@ -20,6 +20,7 @@ import {
 import { processParsing, mergeChunkResults } from '../parsing-processor.js';
 import { fileContentHash, computeChunkHash } from '../../../storage/parse-cache.js';
 import {
+  loadFileParseArtifact,
   splitParseWorkerResultsByFile,
   type CapturedFileParseArtifact,
 } from '../../../storage/file-artifact-cache.js';
@@ -98,6 +99,7 @@ const CHUNK_BYTE_BUDGET = (() => {
 // ── Main parse + resolve function ──────────────────────────────────────────
 
 type ScannedFile = { path: string; size: number };
+type ParseChunk = { paths: string[]; replayRaw?: ParseWorkerResult[] };
 type ProgressFn = (progress: PipelineProgress) => void;
 
 /**
@@ -182,6 +184,73 @@ export async function runChunkedParseAndResolve(
   parseableScanned.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
   const totalParseable = parseableScanned.length;
+  const replayStats = options?.fileArtifactReplay?.stats;
+  if (replayStats) {
+    replayStats.artifactReplayEnabled = false;
+    replayStats.artifactReplayDisabledReason = undefined;
+    replayStats.fileArtifactHits = 0;
+    replayStats.fileArtifactMisses = 0;
+    replayStats.replayedFiles = 0;
+    replayStats.freshParsedFiles = 0;
+  }
+
+  let activeParseableScanned = parseableScanned;
+  const replayChunks: ParseChunk[] = [];
+
+  if (options?.fileArtifactReplay && totalParseable > 0) {
+    const replay = options.fileArtifactReplay;
+    const replayCandidates = parseableScanned.filter((f) => !replay.freshFiles.has(f.path));
+    const freshCandidates = parseableScanned.filter((f) => replay.freshFiles.has(f.path));
+    const replayRaw: ParseWorkerResult[] = [];
+    let disabledReason: string | undefined;
+
+    for (const file of replayCandidates) {
+      const contentHash = replay.currentFileHashes.get(file.path);
+      const language = getLanguageFromFilename(file.path);
+      if (!contentHash || !language) {
+        disabledReason = `missing current hash/language for ${file.path}`;
+        replay.stats.fileArtifactMisses++;
+        break;
+      }
+      const artifact = await loadFileParseArtifact(replay.storagePath, {
+        filePath: file.path,
+        contentHash,
+        language,
+      });
+      if (!artifact) {
+        disabledReason = `missing or invalid artifact for ${file.path}`;
+        replay.stats.fileArtifactMisses++;
+        break;
+      }
+      replay.stats.fileArtifactHits++;
+      replayRaw.push(artifact.payload);
+    }
+
+    if (disabledReason) {
+      replay.stats.artifactReplayEnabled = false;
+      replay.stats.artifactReplayDisabledReason = disabledReason;
+      replay.stats.fileArtifactHits = 0;
+      replay.stats.replayedFiles = 0;
+      activeParseableScanned = parseableScanned;
+      if (isDev) logger.info(`📦 file-artifact replay disabled: ${disabledReason}`);
+    } else {
+      replay.stats.artifactReplayEnabled = true;
+      replay.stats.replayedFiles = replayCandidates.length;
+      replay.stats.freshParsedFiles = freshCandidates.length;
+      activeParseableScanned = freshCandidates;
+      if (replayRaw.length > 0) {
+        replayChunks.push({
+          paths: replayCandidates.map((f) => f.path),
+          replayRaw,
+        });
+      }
+      if (isDev) {
+        logger.info(
+          `📦 file-artifact replay enabled: ${replayCandidates.length} replayed, ${freshCandidates.length} fresh`,
+        );
+      }
+    }
+  }
 
   if (totalParseable === 0) {
     onProgress({
@@ -193,19 +262,19 @@ export async function runChunkedParseAndResolve(
   }
 
   // Build byte-budget chunks
-  const chunks: string[][] = [];
+  const chunks: ParseChunk[] = [...replayChunks];
   let currentChunk: string[] = [];
   let currentBytes = 0;
-  for (const file of parseableScanned) {
+  for (const file of activeParseableScanned) {
     if (currentChunk.length > 0 && currentBytes + file.size > CHUNK_BYTE_BUDGET) {
-      chunks.push(currentChunk);
+      chunks.push({ paths: currentChunk });
       currentChunk = [];
       currentBytes = 0;
     }
     currentChunk.push(file.path);
     currentBytes += file.size;
   }
-  if (currentChunk.length > 0) chunks.push(currentChunk);
+  if (currentChunk.length > 0) chunks.push({ paths: currentChunk });
 
   const numChunks = chunks.length;
 
@@ -228,7 +297,7 @@ export async function runChunkedParseAndResolve(
   // to exercise the worker-pool path with small fixtures; see PipelineOptions.
   const MIN_FILES_FOR_WORKERS = options?.workerThresholdsForTest?.minFiles ?? 15;
   const MIN_BYTES_FOR_WORKERS = options?.workerThresholdsForTest?.minBytes ?? 512 * 1024;
-  const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
+  const totalBytes = activeParseableScanned.reduce((s, f) => s + f.size, 0);
 
   // Create worker pool once, reuse across chunks
   let workerPool: WorkerPool | undefined;
@@ -278,7 +347,7 @@ export async function runChunkedParseAndResolve(
   //     skip a second tree-sitter parse. Worker-mode parses don't
   //     populate either; consumers fall back to a fresh parse.
   // See plan docs/plans/2026-04-20-002-perf-parse-heritage-mro-plan.md (Unit 4).
-  const maxChunkFiles = chunks.reduce((max, c) => Math.max(max, c.length), 0);
+  const maxChunkFiles = chunks.reduce((max, c) => Math.max(max, c.paths.length), 0);
   let astCache = createASTCache(maxChunkFiles);
   const scopeTreeCache = createASTCache(Math.max(parseableScanned.length, 1));
 
@@ -287,8 +356,8 @@ export async function runChunkedParseAndResolve(
   const allPathObjects = allPaths.map((p) => ({ path: p }));
 
   const sequentialChunkPaths: string[][] = [];
-  const chunkNeedsSynthesis = chunks.map((paths) =>
-    paths.some((p) => {
+  const chunkNeedsSynthesis = chunks.map((chunk) =>
+    chunk.paths.some((p) => {
       const lang = getLanguageFromFilename(p);
       return lang != null && needsSynthesis(lang);
     }),
@@ -334,12 +403,13 @@ export async function runChunkedParseAndResolve(
 
   try {
     for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-      const chunkPaths = chunks[chunkIdx];
+      const chunk = chunks[chunkIdx];
+      const chunkPaths = chunk.paths;
 
-      const chunkContents = await readFileContents(repoPath, chunkPaths);
-      const chunkFiles = chunkPaths
-        .filter((p) => chunkContents.has(p))
-        .map((p) => ({ path: p, content: chunkContents.get(p)! }));
+      const chunkContents = chunk.replayRaw ? new Map<string, string>() : await readFileContents(repoPath, chunkPaths);
+      const chunkFiles = chunk.replayRaw
+        ? chunkPaths.map((p) => ({ path: p, content: '' }))
+        : chunkPaths.filter((p) => chunkContents.has(p)).map((p) => ({ path: p, content: chunkContents.get(p)! }));
       const chunkWorkerPool = chunkPaths.some(
         (p) => getLanguageFromFilename(p) === SupportedLanguages.Kotlin,
       )
@@ -348,7 +418,7 @@ export async function runChunkedParseAndResolve(
 
       // Compute the chunk's content-hash signature (if cache available).
       let chunkHash: string | null = null;
-      if (parseCache) {
+      if (parseCache && !chunk.replayRaw) {
         const entries = chunkFiles.map((f) => ({
           filePath: f.path,
           contentHash: fileContentHash(f.content),
@@ -357,14 +427,31 @@ export async function runChunkedParseAndResolve(
       }
 
       let chunkWorkerData: WorkerExtractedData | null;
-      const cachedRaw = chunkHash ? parseCache!.entries.get(chunkHash) : undefined;
+      const cachedRaw = chunk.replayRaw ?? (chunkHash ? parseCache!.entries.get(chunkHash) : undefined);
 
       // Track every chunk hash we touched so the orchestrator can
       // prune stale entries (chunks whose composition no longer
       // corresponds to a live chunk in the current scan) before saving.
       if (parseCache && chunkHash) parseCache.usedKeys.add(chunkHash);
 
-      if (cachedRaw && cachedRaw.length > 0) {
+      if (chunk.replayRaw && cachedRaw.length > 0) {
+        chunkWorkerData = mergeChunkResults(graph, symbolTable, cachedRaw);
+        if (isDev) {
+          logger.info(
+            `📦 file-artifact replay: chunk ${chunkIdx + 1}/${numChunks} (${chunkFiles.length} files)`,
+          );
+        }
+        onProgress({
+          phase: 'parsing',
+          percent: Math.round(20 + ((filesParsedSoFar + chunkFiles.length) / totalParseable) * 62),
+          message: `Replaying parse artifacts ${chunkIdx + 1}/${numChunks}...`,
+          stats: {
+            filesProcessed: filesParsedSoFar + chunkFiles.length,
+            totalFiles: totalParseable,
+            nodesCreated: graph.nodeCount,
+          },
+        });
+      } else if (cachedRaw && cachedRaw.length > 0) {
         // Cache hit: replay the cached worker output through the same
         // merge logic the live worker path uses.
         chunkCacheHits++;
@@ -771,7 +858,7 @@ export async function runChunkedParseAndResolve(
     parseCacheHits: chunkCacheHits,
     parseCacheMisses: chunkCacheMisses,
     parsedFilesCount: liveParsedFiles,
-    replayedFiles: 0,
+    replayedFiles: replayStats?.replayedFiles ?? 0,
     fileParseArtifacts: [...fileParseArtifacts.values()].sort((a, b) =>
       a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0,
     ),

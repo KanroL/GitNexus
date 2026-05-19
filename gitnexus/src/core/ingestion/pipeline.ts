@@ -67,8 +67,27 @@ export interface PipelineOptions {
    * before the pipeline runs and persisting it after. Cache survives
    * `--force` because keys are content-addressed.
    * See `gitnexus/src/storage/parse-cache.ts`.
-   */
+  */
   parseCache?: import('../../storage/parse-cache.js').ParseCache;
+  /**
+   * Strict per-file artifact replay for changed-file-only incremental parsing.
+   * The parse phase mutates `stats` with the final enabled/disabled decision.
+   */
+  fileArtifactReplay?: {
+    storagePath: string;
+    currentFileHashes: ReadonlyMap<string, string>;
+    freshFiles: ReadonlySet<string>;
+    stats: FileArtifactReplayStats;
+  };
+}
+
+export interface FileArtifactReplayStats {
+  artifactReplayEnabled: boolean;
+  artifactReplayDisabledReason?: string;
+  fileArtifactHits: number;
+  fileArtifactMisses: number;
+  replayedFiles: number;
+  freshParsedFiles: number;
 }
 
 // ── Phase registry ─────────────────────────────────────────────────────────
@@ -176,7 +195,12 @@ export const runPipelineFromRepo = async (
       parseCacheHits: parseOutput.parseCacheHits,
       parseCacheMisses: parseOutput.parseCacheMisses,
       parsedFiles: parseOutput.parsedFilesCount,
+      fileArtifactHits: options?.fileArtifactReplay?.stats.fileArtifactHits ?? 0,
+      fileArtifactMisses: options?.fileArtifactReplay?.stats.fileArtifactMisses ?? 0,
       replayedFiles: parseOutput.replayedFiles,
+      artifactReplayEnabled: options?.fileArtifactReplay?.stats.artifactReplayEnabled ?? false,
+      artifactReplayDisabledReason:
+        options?.fileArtifactReplay?.stats.artifactReplayDisabledReason,
     },
     fileParseArtifacts: parseOutput.fileParseArtifacts,
   };

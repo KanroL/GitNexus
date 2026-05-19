@@ -40,6 +40,7 @@ import { walkRepositoryPaths } from './ingestion/filesystem-walker.js';
 import { extractChangedSubgraph } from './incremental/subgraph-extract.js';
 import { deriveIncrementalPlan } from './incremental/plan.js';
 import { deriveIncrementalWriteSet } from './incremental/write-set.js';
+import { shadowCandidatesFor } from './incremental/shadow-candidates.js';
 import { validateIncrementalGraphConsistency } from './incremental/validation.js';
 import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
@@ -188,7 +189,11 @@ interface AnalyzeProfileCounters {
   parseCacheHits: number;
   parseCacheMisses: number;
   parsedFiles: number;
+  fileArtifactHits: number;
+  fileArtifactMisses: number;
   replayedFiles: number;
+  artifactReplayEnabled: boolean;
+  artifactReplayDisabledReason?: string;
 }
 
 export const isAnalyzeProfilingEnabled = (): boolean => process.env.GITNEXUS_VERBOSE === '1';
@@ -203,7 +208,7 @@ export const formatAnalyzeProfileLog = (
   counters: AnalyzeProfileCounters,
 ): string[] => [
   'Analyze profile:',
-  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, replayedFiles=${counters.replayedFiles}`,
+  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, artifactReplay=${counters.artifactReplayEnabled ? 'enabled' : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}`,
   `  pipeline: scan=${formatMs(timings.scanMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, graphAssembly=${formatMs(timings.graphAssemblyMs)}, crossFile=${formatMs(timings.crossFileMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
   `  orchestration: hash=${formatMs(timings.hashMs)}, incrementalPlanning=${formatMs(timings.incrementalPlanningMs)}, dbWriteback=${formatMs(timings.dbWritebackMs)}, validation=${formatMs(timings.validationMs)}, checkpointReopen=${formatMs(timings.checkpointReopenMs)}, total=${formatMs(timings.totalAnalyzeMs)}`,
 ];
@@ -450,6 +455,60 @@ export async function runFullAnalysis(
     }
   }
 
+  const fileArtifactReplayStats = {
+    artifactReplayEnabled: false,
+    artifactReplayDisabledReason: isIncremental ? undefined : incrementalPlan.reason,
+    fileArtifactHits: 0,
+    fileArtifactMisses: 0,
+    replayedFiles: 0,
+    freshParsedFiles: 0,
+  };
+
+  let incrementalFreshFiles: Set<string> | undefined;
+  if (isIncremental && hashDiff) {
+    incrementalFreshFiles = new Set(hashDiff.toWrite);
+    const priorFileSet = new Set(existingMeta?.fileHashes ? Object.keys(existingMeta.fileHashes) : []);
+    const shadowCandidates: string[] = [];
+    for (const added of hashDiff.added) {
+      for (const candidate of shadowCandidatesFor(added)) {
+        if (priorFileSet.has(candidate) && !incrementalFreshFiles.has(candidate)) {
+          incrementalFreshFiles.add(candidate);
+          shadowCandidates.push(candidate);
+        }
+      }
+    }
+
+    try {
+      await initLbug(lbugPath);
+      const seenFrontier = new Set<string>();
+      let frontier = [...hashDiff.toWrite, ...hashDiff.deleted, ...shadowCandidates];
+      for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
+        const nextFrontier: string[] = [];
+        for (const f of frontier) {
+          if (seenFrontier.has(f)) continue;
+          seenFrontier.add(f);
+          const importers = await queryImporters(f);
+          for (const importer of importers) {
+            if (!incrementalFreshFiles.has(importer)) {
+              incrementalFreshFiles.add(importer);
+              nextFrontier.push(importer);
+            }
+          }
+        }
+        frontier = nextFrontier;
+      }
+      if (frontier.length > 0) {
+        fileArtifactReplayStats.artifactReplayDisabledReason = 'importer expansion exceeded max depth';
+        incrementalFreshFiles = undefined;
+      }
+    } catch (err) {
+      fileArtifactReplayStats.artifactReplayDisabledReason = `importer expansion failed: ${(err as Error).message}`;
+      incrementalFreshFiles = undefined;
+    } finally {
+      await closeLbug();
+    }
+  }
+
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
   const pipelineResult = await runPipelineFromRepo(
     repoPath,
@@ -461,8 +520,30 @@ export async function runFullAnalysis(
         : p.message || phaseLabel;
       progress(p.phase, scaled, message);
     },
-    { parseCache, workerThresholdsForTest: options.workerThresholdsForTest },
+    {
+      parseCache,
+      workerThresholdsForTest: options.workerThresholdsForTest,
+      ...(isIncremental && hashDiff && incrementalFreshFiles
+        ? {
+            fileArtifactReplay: {
+              storagePath,
+              currentFileHashes: newFileHashes,
+              freshFiles: incrementalFreshFiles,
+              stats: fileArtifactReplayStats,
+            },
+          }
+        : {}),
+    },
   );
+
+  if (isAnalyzeProfilingEnabled()) {
+    const reason = pipelineResult.parseStats.artifactReplayEnabled
+      ? 'enabled'
+      : `disabled: ${pipelineResult.parseStats.artifactReplayDisabledReason ?? fileArtifactReplayStats.artifactReplayDisabledReason ?? 'not attempted'}`;
+    log(
+      `File artifact replay: ${reason}, hits=${pipelineResult.parseStats.fileArtifactHits}, misses=${pipelineResult.parseStats.fileArtifactMisses}, replayed=${pipelineResult.parseStats.replayedFiles}, freshParsed=${pipelineResult.parseStats.parsedFiles}`,
+    );
+  }
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
   progress('lbug', 60, 'Loading into LadybugDB...');
@@ -967,7 +1048,10 @@ export async function runFullAnalysis(
           parseCacheHits: 0,
           parseCacheMisses: 0,
           parsedFiles: 0,
+          fileArtifactHits: 0,
+          fileArtifactMisses: 0,
           replayedFiles: 0,
+          artifactReplayEnabled: false,
         },
       );
       for (const line of profileLines) log(line);

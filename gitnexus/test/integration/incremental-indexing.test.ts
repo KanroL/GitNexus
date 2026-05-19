@@ -506,6 +506,10 @@ describe('incremental indexing integration', () => {
       expect(incremental.pipelineResult?.parseStats.parsedFiles).toBeLessThan(
         incremental.pipelineResult!.parseStats.replayedFiles,
       );
+      expect(incremental.pipelineResult?.scopeStats.preExtractedHits).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.scopeStats.filesExtracted).toBeLessThan(
+        incremental.pipelineResult!.scopeStats.filesResolved,
+      );
 
       const statusPaths = getStoragePaths(repo.dbPath);
       const meta = await loadMeta(statusPaths.storagePath);

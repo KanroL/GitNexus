@@ -44,8 +44,7 @@ import { shadowCandidatesFor } from './incremental/shadow-candidates.js';
 import { validateIncrementalGraphConsistency } from './incremental/validation.js';
 import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
-  pruneFileArtifactCache,
-  saveFileParseArtifact,
+  saveFileParseArtifactsBatch,
 } from '../storage/file-artifact-cache.js';
 import {
   getCurrentCommit,
@@ -189,6 +188,11 @@ interface AnalyzeProfileTimings {
   crossFileMs: number;
   scopeResolutionMs: number;
   mroMs: number;
+  scopeExtractMs: number;
+  scopeFinalizeMs: number;
+  scopePropagateMs: number;
+  scopeResolveMs: number;
+  scopeEmitMs: number;
   communitiesMs: number;
   processesMs: number;
   dbWritebackMs: number;
@@ -223,6 +227,10 @@ interface AnalyzeProfileCounters {
   replayedFiles: number;
   artifactReplayEnabled: boolean;
   artifactReplayDisabledReason?: string;
+  scopePreExtractedHits?: number;
+  scopePreExtractedMisses?: number;
+  scopeFilesExtracted?: number;
+  scopeFilesResolved?: number;
 }
 
 export const isAnalyzeProfilingEnabled = (): boolean => process.env.GITNEXUS_VERBOSE === '1';
@@ -254,7 +262,9 @@ export const formatAnalyzeProfileLog = (
 ): string[] => [
   'Analyze profile:',
   `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, artifactReplay=${counters.artifactReplayEnabled ? 'enabled' : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}`,
+  `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
+  `  scopeResolution: extract=${formatMs(timings.scopeExtractMs)}, finalize=${formatMs(timings.scopeFinalizeMs)}, propagate=${formatMs(timings.scopePropagateMs)}, resolve=${formatMs(timings.scopeResolveMs)}, emit=${formatMs(timings.scopeEmitMs)}`,
   `  db: writeback=${formatMs(timings.dbWritebackMs)}, init=${formatMs(timings.lbugInitMs)}, close=${formatMs(timings.finalCloseMs)}, dirtyMeta=${formatMs(timings.dirtyMetaMs)}, fullWipe=${formatMs(timings.fullWipeMs)}, writeSetPlanning=${formatMs(timings.writeSetPlanningMs)}, deleteRows=${formatMs(timings.deleteRowsMs)}, deleteGraphWide=${formatMs(timings.deleteGraphWideMs)}, subgraphExtract=${formatMs(timings.subgraphExtractMs)}, graphLoad=${formatMs(timings.graphLoadMs)}, validation=${formatMs(timings.validationMs)}, checkpointReopen=${formatMs(timings.checkpointReopenMs)}`,
   `  postDb: fts=${formatMs(timings.ftsMs)}, embeddingCacheLoad=${formatMs(timings.embeddingCacheLoadMs)}, embeddingRestore=${formatMs(timings.embeddingRestoreMs)}, embeddingGenerate=${formatMs(timings.embeddingGenerateMs)}, metadata=${formatMs(timings.metadataMs)}, cacheSave=${formatMs(timings.cacheSaveMs)}, fileArtifactSave=${formatMs(timings.fileArtifactSaveMs)}, registry=${formatMs(timings.registryMs)}, contextFiles=${formatMs(timings.contextFilesMs)}`,
   `  orchestration: preflight=${formatMs(timings.preflightMs)}, parseCacheLoad=${formatMs(timings.parseCacheLoadMs)}, hash=${formatMs(timings.hashMs)}, incrementalPlanning=${formatMs(timings.incrementalPlanningMs)}, importerExpansion=${formatMs(timings.importerExpansionMs)}, accounted=${formatMs(sumProfileMajorTimings(timings))}, unaccounted=${formatMs(timings.totalAnalyzeMs - sumProfileMajorTimings(timings))}, total=${formatMs(timings.totalAnalyzeMs)}`,
@@ -1100,10 +1110,17 @@ export async function runFullAnalysis(
     try {
       const fileArtifactSaveStart = Date.now();
       const artifacts = pipelineResult.fileParseArtifacts ?? [];
+      const shouldLimitArtifactSave =
+        isIncremental &&
+        pipelineResult.parseStats?.artifactReplayEnabled === true &&
+        incrementalFreshFiles !== undefined;
+      const artifactSaveSet = shouldLimitArtifactSave ? incrementalFreshFiles : undefined;
+      const inputs = [];
       for (const artifact of artifacts) {
+        if (artifactSaveSet !== undefined && !artifactSaveSet.has(artifact.filePath)) continue;
         const contentHash = newFileHashes.get(artifact.filePath);
         if (!contentHash) continue;
-        await saveFileParseArtifact(storagePath, {
+        inputs.push({
           filePath: artifact.filePath,
           contentHash,
           language: artifact.language,
@@ -1111,7 +1128,7 @@ export async function runFullAnalysis(
           payload: artifact.payload,
         });
       }
-      const pruned = await pruneFileArtifactCache(storagePath, newFileHashes);
+      const { pruned } = await saveFileParseArtifactsBatch(storagePath, inputs, newFileHashes);
       if (pruned > 0) {
         log(`File artifact cache: pruned ${pruned} stale artifact(s)`);
       }
@@ -1203,6 +1220,11 @@ export async function runFullAnalysis(
           crossFileMs: phaseTimings.crossFile ?? 0,
           scopeResolutionMs: phaseTimings.scopeResolution ?? 0,
           mroMs: phaseTimings.mro ?? 0,
+          scopeExtractMs: pipelineResult.scopeStats?.extractMs ?? 0,
+          scopeFinalizeMs: pipelineResult.scopeStats?.finalizeMs ?? 0,
+          scopePropagateMs: pipelineResult.scopeStats?.propagateMs ?? 0,
+          scopeResolveMs: pipelineResult.scopeStats?.resolveMs ?? 0,
+          scopeEmitMs: pipelineResult.scopeStats?.emitMs ?? 0,
           communitiesMs: phaseTimings.communities ?? 0,
           processesMs: phaseTimings.processes ?? 0,
           dbWritebackMs: profile.dbWritebackMs,
@@ -1227,14 +1249,20 @@ export async function runFullAnalysis(
           finalCloseMs: profile.finalCloseMs,
           totalAnalyzeMs: Date.now() - analyzeStart,
         },
-        pipelineResult.parseStats ?? {
-          parseCacheHits: 0,
-          parseCacheMisses: 0,
-          parsedFiles: 0,
-          fileArtifactHits: 0,
-          fileArtifactMisses: 0,
-          replayedFiles: 0,
-          artifactReplayEnabled: false,
+        {
+          ...(pipelineResult.parseStats ?? {
+            parseCacheHits: 0,
+            parseCacheMisses: 0,
+            parsedFiles: 0,
+            fileArtifactHits: 0,
+            fileArtifactMisses: 0,
+            replayedFiles: 0,
+            artifactReplayEnabled: false,
+          }),
+          scopePreExtractedHits: pipelineResult.scopeStats?.preExtractedHits ?? 0,
+          scopePreExtractedMisses: pipelineResult.scopeStats?.preExtractedMisses ?? 0,
+          scopeFilesExtracted: pipelineResult.scopeStats?.filesExtracted ?? 0,
+          scopeFilesResolved: pipelineResult.scopeStats?.filesResolved ?? 0,
         },
       );
       for (const line of profileLines) log(line);

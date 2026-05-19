@@ -31,6 +31,17 @@ export interface PipelineResult {
     artifactReplayEnabled: boolean;
     artifactReplayDisabledReason?: string;
   };
+  scopeStats: {
+    preExtractedHits: number;
+    preExtractedMisses: number;
+    filesExtracted: number;
+    filesResolved: number;
+    extractMs: number;
+    finalizeMs: number;
+    propagateMs: number;
+    resolveMs: number;
+    emitMs: number;
+  };
   /** Worker-equivalent per-file artifacts captured for optional cache persistence. */
   fileParseArtifacts: readonly CapturedFileParseArtifact[];
 }

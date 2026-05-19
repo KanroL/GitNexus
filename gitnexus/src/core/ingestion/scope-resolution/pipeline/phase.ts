@@ -39,6 +39,20 @@ import { SCOPE_RESOLVERS } from './registry.js';
 import { isDev, isSemanticModelValidatorEnabled } from '../../utils/env.js';
 
 import { logger } from '../../../logger.js';
+
+const isUsableParsedFile = (value: unknown): value is import('gitnexus-shared').ParsedFile => {
+  if (!value || typeof value !== 'object') return false;
+  const parsed = value as Record<string, unknown>;
+  return (
+    typeof parsed.filePath === 'string' &&
+    typeof parsed.moduleScope === 'string' &&
+    Array.isArray(parsed.scopes) &&
+    Array.isArray(parsed.parsedImports) &&
+    Array.isArray(parsed.localDefs) &&
+    Array.isArray(parsed.referenceSites)
+  );
+};
+
 export interface ScopeResolutionOutput {
   /** True when at least one language ran. */
   readonly ran: boolean;
@@ -48,6 +62,16 @@ export interface ScopeResolutionOutput {
   readonly importsEmitted: number;
   /** Reference (CALLS / ACCESSES / INHERITS / USES) edges emitted. */
   readonly referenceEdgesEmitted: number;
+  readonly preExtractedHits: number;
+  readonly preExtractedMisses: number;
+  readonly filesExtracted: number;
+  readonly timings: {
+    readonly extractMs: number;
+    readonly finalizeMs: number;
+    readonly propagateMs: number;
+    readonly resolveMs: number;
+    readonly emitMs: number;
+  };
   /** Per-language breakdown for telemetry / shadow-parity. */
   readonly perLanguage: ReadonlyMap<
     SupportedLanguages,
@@ -64,6 +88,10 @@ const NOOP_OUTPUT: ScopeResolutionOutput = Object.freeze({
   filesProcessed: 0,
   importsEmitted: 0,
   referenceEdgesEmitted: 0,
+  preExtractedHits: 0,
+  preExtractedMisses: 0,
+  filesExtracted: 0,
+  timings: { extractMs: 0, finalizeMs: 0, propagateMs: 0, resolveMs: 0, emitMs: 0 },
   perLanguage: new Map(),
 });
 
@@ -109,12 +137,17 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
     // every file from scratch on the main thread.
     const preExtractedByPath = new Map<string, import('gitnexus-shared').ParsedFile>();
     for (const pf of workerParsedFiles) {
+      if (!isUsableParsedFile(pf)) continue;
       preExtractedByPath.set(pf.filePath, pf);
     }
 
     let totalFiles = 0;
     let totalImports = 0;
     let totalRefs = 0;
+    let totalPreExtractedHits = 0;
+    let totalPreExtractedMisses = 0;
+    let totalFilesExtracted = 0;
+    const totalTimings = { extractMs: 0, finalizeMs: 0, propagateMs: 0, resolveMs: 0, emitMs: 0 };
     let anyRan = false;
     const perLanguage = new Map<
       SupportedLanguages,
@@ -169,6 +202,14 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       totalFiles += stats.filesProcessed;
       totalImports += stats.importsEmitted;
       totalRefs += stats.referenceEdgesEmitted;
+      totalPreExtractedHits += stats.preExtractedHits;
+      totalPreExtractedMisses += stats.preExtractedMisses;
+      totalFilesExtracted += stats.filesExtracted;
+      totalTimings.extractMs += stats.timings.extractMs;
+      totalTimings.finalizeMs += stats.timings.finalizeMs;
+      totalTimings.propagateMs += stats.timings.propagateMs;
+      totalTimings.resolveMs += stats.timings.resolveMs;
+      totalTimings.emitMs += stats.timings.emitMs;
       perLanguage.set(lang, {
         filesProcessed: stats.filesProcessed,
         importsEmitted: stats.importsEmitted,
@@ -197,6 +238,10 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       filesProcessed: totalFiles,
       importsEmitted: totalImports,
       referenceEdgesEmitted: totalRefs,
+      preExtractedHits: totalPreExtractedHits,
+      preExtractedMisses: totalPreExtractedMisses,
+      filesExtracted: totalFilesExtracted,
+      timings: totalTimings,
       perLanguage,
     };
   },

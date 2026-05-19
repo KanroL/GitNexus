@@ -11,6 +11,7 @@ import {
   loadFileParseArtifact,
   pruneFileArtifactCache,
   saveFileParseArtifact,
+  saveFileParseArtifactsBatch,
   splitParseWorkerResultsByFile,
 } from '../../src/storage/file-artifact-cache.js';
 
@@ -290,6 +291,55 @@ describe('file artifact cache', () => {
         loadFileParseArtifact(storagePath, { filePath: 'src/b.ts', contentHash: 'hash-b' }),
       ).resolves.toBeNull();
       expect(await shardPaths(storagePath)).toHaveLength(1);
+    });
+  });
+
+  it('saves artifact batches with one index update and prunes stale entries', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/stale.ts',
+        contentHash: 'old-hash',
+        payload: minimalResult(),
+      });
+
+      const result = await saveFileParseArtifactsBatch(
+        storagePath,
+        [
+          {
+            filePath: 'src/a.ts',
+            contentHash: 'hash-a',
+            language: 'typescript',
+            payload: minimalResult({ parsedFiles: [{ filePath: 'src/a.ts', scopes: [] }] as any }),
+          },
+          {
+            filePath: 'src/b.ts',
+            contentHash: 'hash-b',
+            language: 'typescript',
+            payload: minimalResult(),
+          },
+        ],
+        new Map<string, string>([
+          ['src/a.ts', 'hash-a'],
+          ['src/b.ts', 'hash-b'],
+        ]),
+      );
+
+      expect(result).toEqual({ saved: 2, pruned: 1 });
+      await expect(
+        loadFileParseArtifact(storagePath, {
+          filePath: 'src/a.ts',
+          contentHash: 'hash-a',
+          language: 'typescript',
+        }),
+      ).resolves.not.toBeNull();
+      await expect(
+        loadFileParseArtifact(storagePath, { filePath: 'src/stale.ts', contentHash: 'old-hash' }),
+      ).resolves.toBeNull();
+
+      const index = JSON.parse(
+        await fs.readFile(path.join(getFileArtifactCacheDir(storagePath), 'index.json'), 'utf-8'),
+      ) as { artifacts?: unknown[] };
+      expect(index.artifacts).toHaveLength(2);
     });
   });
 

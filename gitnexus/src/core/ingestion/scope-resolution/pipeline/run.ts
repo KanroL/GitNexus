@@ -165,11 +165,23 @@ interface RunScopeResolutionInput {
 interface RunScopeResolutionStats {
   readonly filesProcessed: number;
   readonly filesSkipped: number;
+  readonly preExtractedHits: number;
+  readonly preExtractedMisses: number;
+  readonly filesExtracted: number;
   readonly importsEmitted: number;
   readonly resolve: ResolveStats;
   readonly referenceEdgesEmitted: number;
   readonly referenceSkipped: number;
+  readonly timings: {
+    readonly extractMs: number;
+    readonly finalizeMs: number;
+    readonly propagateMs: number;
+    readonly resolveMs: number;
+    readonly emitMs: number;
+  };
 }
+
+const elapsedMs = (start: bigint, end: bigint): number => Number(end - start) / 1_000_000;
 
 export function runScopeResolution(
   input: RunScopeResolutionInput,
@@ -178,7 +190,7 @@ export function runScopeResolution(
   const { graph, files } = input;
   const onWarn = input.onWarn ?? (() => {});
   const PROF = process.env.PROF_SCOPE_RESOLUTION === '1';
-  const tStart = PROF ? process.hrtime.bigint() : 0n;
+  const tStart = process.hrtime.bigint();
   let fileContents: Map<string, string> | undefined;
   const getFileContents = (): Map<string, string> => {
     if (fileContents === undefined) {
@@ -194,6 +206,8 @@ export function runScopeResolution(
   const treeCache = input.treeCache;
   const preExtracted = input.preExtractedParsedFiles;
   let preExtractedHits = 0;
+  let preExtractedMisses = 0;
+  let filesExtracted = 0;
   for (const file of files) {
     let parsed: ParsedFile | undefined;
     // Fast path: a worker (during the parse phase) already produced a
@@ -204,6 +218,7 @@ export function runScopeResolution(
       if (parsed !== undefined) preExtractedHits++;
     }
     if (parsed === undefined) {
+      preExtractedMisses++;
       const cachedTree = treeCache?.get(file.path);
       parsed = extractParsedFile(
         provider.languageProvider,
@@ -216,6 +231,7 @@ export function runScopeResolution(
         filesSkipped++;
         continue;
       }
+      filesExtracted++;
     }
     provider.populateOwners(parsed);
     parsedFiles.push(parsed);
@@ -238,19 +254,28 @@ export function runScopeResolution(
   reconcileOwnership(parsedFiles, input.model);
   validateOwnershipParity(parsedFiles, input.model, onWarn);
   const readonlyModel: SemanticModel = input.model;
+  const tExtract = process.hrtime.bigint();
 
   if (parsedFiles.length === 0) {
     return {
       filesProcessed: 0,
       filesSkipped,
+      preExtractedHits,
+      preExtractedMisses,
+      filesExtracted,
       importsEmitted: 0,
       resolve: { sitesProcessed: 0, referencesEmitted: 0, unresolved: 0 },
       referenceEdgesEmitted: 0,
       referenceSkipped: 0,
+      timings: {
+        extractMs: elapsedMs(tStart, tExtract),
+        finalizeMs: 0,
+        propagateMs: 0,
+        resolveMs: 0,
+        emitMs: 0,
+      },
     };
   }
-
-  const tExtract = PROF ? process.hrtime.bigint() : 0n;
 
   // ── Phase 2: finalize → ScopeResolutionIndexes ─────────────────────────
   const allFilePaths = new Set(parsedFiles.map((f) => f.filePath));
@@ -301,7 +326,7 @@ export function runScopeResolution(
     });
   }
 
-  const tFinalize = PROF ? process.hrtime.bigint() : 0n;
+  const tFinalize = process.hrtime.bigint();
 
   // Cross-package namespace typeBinding mirroring. Runs before
   // propagateImportedReturnTypes so the SCC-ordered pass sees the
@@ -325,7 +350,7 @@ export function runScopeResolution(
       treeCache,
     });
   }
-  const tPropagate = PROF ? process.hrtime.bigint() : 0n;
+  const tPropagate = process.hrtime.bigint();
 
   // Opt-in I8 invariant guard. Runs once after all post-finalize hooks
   // (`populateNamespaceSiblings`, `propagateImportedReturnTypes`) have
@@ -343,7 +368,7 @@ export function runScopeResolution(
     scopes: indexes,
     providers: registryProviders,
   });
-  const tResolve = PROF ? process.hrtime.bigint() : 0n;
+  const tResolve = process.hrtime.bigint();
 
   // ── Phase 4: emit graph edges (LOAD-BEARING ORDER — see I1) ────────────
   const handledSites = new Set<string>(preEmittedInheritanceSites);
@@ -399,16 +424,23 @@ export function runScopeResolution(
     provider.importEdgeReason,
   );
 
+  const tEnd = process.hrtime.bigint();
+  const timings = {
+    extractMs: elapsedMs(tStart, tExtract),
+    finalizeMs: elapsedMs(tExtract, tFinalize),
+    propagateMs: elapsedMs(tFinalize, tPropagate),
+    resolveMs: elapsedMs(tPropagate, tResolve),
+    emitMs: elapsedMs(tResolve, tEnd),
+  };
+
   if (PROF) {
-    const tEnd = process.hrtime.bigint();
-    const ns = (a: bigint, b: bigint): number => Number(b - a) / 1_000_000;
     logger.warn(
-      `[scope-resolution prof] extract=${ns(tStart, tExtract).toFixed(0)}ms` +
-        ` finalize=${ns(tExtract, tFinalize).toFixed(0)}ms` +
-        ` propagate=${ns(tFinalize, tPropagate).toFixed(0)}ms` +
-        ` resolve=${ns(tPropagate, tResolve).toFixed(0)}ms` +
-        ` emit=${ns(tResolve, tEnd).toFixed(0)}ms` +
-        ` total=${ns(tStart, tEnd).toFixed(0)}ms` +
+      `[scope-resolution prof] extract=${timings.extractMs.toFixed(0)}ms` +
+        ` finalize=${timings.finalizeMs.toFixed(0)}ms` +
+        ` propagate=${timings.propagateMs.toFixed(0)}ms` +
+        ` resolve=${timings.resolveMs.toFixed(0)}ms` +
+        ` emit=${timings.emitMs.toFixed(0)}ms` +
+        ` total=${elapsedMs(tStart, tEnd).toFixed(0)}ms` +
         ` (${parsedFiles.length} files)`,
     );
   }
@@ -416,9 +448,13 @@ export function runScopeResolution(
   return {
     filesProcessed: parsedFiles.length,
     filesSkipped,
+    preExtractedHits,
+    preExtractedMisses,
+    filesExtracted,
     importsEmitted,
     resolve: resolveStats,
     referenceEdgesEmitted: emitted + receiverExtras + unresolvedReceiverExtras + freeCallExtras,
     referenceSkipped: skipped,
+    timings,
   };
 }

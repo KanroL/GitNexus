@@ -62,6 +62,11 @@ export interface SaveFileParseArtifactInput {
   payload: ParseWorkerResult;
 }
 
+export interface SaveFileParseArtifactsBatchResult {
+  saved: number;
+  pruned: number;
+}
+
 export interface CapturedFileParseArtifact {
   filePath: string;
   language?: SupportedLanguages | string;
@@ -406,6 +411,66 @@ export const saveFileParseArtifact = async (
   });
   await saveIndex(storagePath, { version: FILE_ARTIFACT_CACHE_VERSION, artifacts: nextArtifacts });
   return artifact;
+};
+
+export const saveFileParseArtifactsBatch = async (
+  storagePath: string,
+  inputs: readonly SaveFileParseArtifactInput[],
+  liveFileHashes: ReadonlyMap<string, string>,
+): Promise<SaveFileParseArtifactsBatchResult> => {
+  const index = await loadIndex(storagePath);
+  let nextArtifacts = index.artifacts.slice();
+  let saved = 0;
+
+  for (const input of inputs) {
+    const key = artifactKey(input);
+    const shard = shardForKey(key);
+    const artifact: FileParseArtifact = {
+      version: FILE_ARTIFACT_CACHE_VERSION,
+      artifactSchemaVersion: FILE_ARTIFACT_SCHEMA_VERSION,
+      filePath: input.filePath,
+      contentHash: input.contentHash,
+      ...(input.language !== undefined ? { language: input.language } : {}),
+      ...(input.parserKey !== undefined ? { parserKey: input.parserKey } : {}),
+      payload: input.payload,
+    };
+
+    const absShardPath = shardPath(storagePath, shard)!;
+    await fs.mkdir(path.dirname(absShardPath), { recursive: true });
+    await fs.writeFile(absShardPath, JSON.stringify(artifact, mapReplacer), 'utf-8');
+    nextArtifacts = nextArtifacts.filter(
+      (entry) =>
+        !(
+          entry.filePath === input.filePath &&
+          entry.contentHash === input.contentHash &&
+          entry.language === input.language &&
+          entry.parserKey === input.parserKey
+        ),
+    );
+    nextArtifacts.push({
+      filePath: input.filePath,
+      contentHash: input.contentHash,
+      ...(input.language !== undefined ? { language: input.language } : {}),
+      ...(input.parserKey !== undefined ? { parserKey: input.parserKey } : {}),
+      shard,
+    });
+    saved++;
+  }
+
+  const kept: FileArtifactCacheIndexEntry[] = [];
+  let pruned = 0;
+  for (const entry of nextArtifacts) {
+    if (liveFileHashes.get(entry.filePath) === entry.contentHash) {
+      kept.push(entry);
+      continue;
+    }
+    pruned++;
+    const absShardPath = shardPath(storagePath, entry.shard);
+    if (absShardPath) await fs.rm(absShardPath, { force: true });
+  }
+
+  await saveIndex(storagePath, { version: FILE_ARTIFACT_CACHE_VERSION, artifacts: kept });
+  return { saved, pruned };
 };
 
 export const pruneFileArtifactCache = async (

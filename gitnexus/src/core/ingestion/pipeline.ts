@@ -38,6 +38,7 @@ import {
   type PipelinePhase,
   type CommunitiesOutput,
   type ProcessesOutput,
+  type ScopeResolutionOutput,
 } from './pipeline-phases/index.js';
 
 export interface PipelineOptions {
@@ -156,6 +157,7 @@ export const runPipelineFromRepo = async (
     fileParseArtifacts: readonly CapturedFileParseArtifact[];
   }>(results, 'parse');
   const { totalFiles, usedWorkerPool } = parseOutput;
+  const scopeOutput = getPhaseOutput<ScopeResolutionOutput>(results, 'scopeResolution');
 
   const phaseTimings: Record<string, number> = {};
   for (const [phaseName, result] of results) {
@@ -202,6 +204,17 @@ export const runPipelineFromRepo = async (
       artifactReplayEnabled: options?.fileArtifactReplay?.stats.artifactReplayEnabled ?? false,
       artifactReplayDisabledReason:
         options?.fileArtifactReplay?.stats.artifactReplayDisabledReason,
+    },
+    scopeStats: {
+      preExtractedHits: scopeOutput.preExtractedHits,
+      preExtractedMisses: scopeOutput.preExtractedMisses,
+      filesExtracted: scopeOutput.filesExtracted,
+      filesResolved: scopeOutput.filesProcessed,
+      extractMs: scopeOutput.timings.extractMs,
+      finalizeMs: scopeOutput.timings.finalizeMs,
+      propagateMs: scopeOutput.timings.propagateMs,
+      resolveMs: scopeOutput.timings.resolveMs,
+      emitMs: scopeOutput.timings.emitMs,
     },
     fileParseArtifacts: parseOutput.fileParseArtifacts,
   };

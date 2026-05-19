@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { access, mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { access, mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
@@ -202,6 +202,22 @@ describe('incremental indexing integration', () => {
       expect(
         artifact?.payload.nodes.some((node) => node.properties.filePath === artifact.filePath),
       ).toBe(true);
+
+      const beforeStat = await stat(indexPath);
+      execSync('git update-index --chmod=+x src/artifact-0.ts', {
+        cwd: repo.dbPath,
+        stdio: 'pipe',
+      });
+      const events: string[] = [];
+      const second = await runFullAnalysis(repo.dbPath, analyzeOptions, {
+        onProgress: (phase) => events.push(`progress:${phase}`),
+        onLog: (message) => events.push(`log:${message}`),
+      });
+      const afterStat = await stat(indexPath);
+      expect(second.alreadyUpToDate).toBe(true);
+      expect(events).toContain('log:Already up to date');
+      expect(events).not.toContain('progress:extracting');
+      expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs);
 
     } finally {
       await closeLbug();

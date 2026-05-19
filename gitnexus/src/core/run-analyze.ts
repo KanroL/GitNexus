@@ -444,59 +444,6 @@ export async function runFullAnalysis(
     );
   }
 
-  // We *always* load the embedding cache when one is requested (regardless
-  // of the predicted `willTryIncremental`). The post-pipeline branch may
-  // disagree with the prediction (e.g. when the pipeline produces zero
-  // File nodes, `isIncremental` flips false and the full-rebuild path
-  // wipes the DB) — loading unconditionally is cheap insurance against
-  // silently dropping embeddings on a mispredicted run. The re-insert
-  // step gates itself on the actual `isIncremental` value to avoid
-  // PK-conflicts when the incremental writeback path keeps the rows.
-  if (shouldLoadCache && existingMeta) {
-    const embeddingCacheLoadStart = Date.now();
-    try {
-      progress('embeddings', 0, 'Caching embeddings...');
-      const initStart = Date.now();
-      await initLbug(lbugPath);
-      profile.lbugInitMs += Date.now() - initStart;
-      const cached = await loadCachedEmbeddings();
-      cachedEmbeddingNodeIds = cached.embeddingNodeIds;
-      cachedEmbeddings = cached.embeddings;
-      const closeStart = Date.now();
-      await closeLbug();
-      profile.finalCloseMs += Date.now() - closeStart;
-    } catch (err: any) {
-      // Surface cache-load failures explicitly: silently swallowing here would
-      // re-introduce the original silent-data-loss symptom (embeddings end up
-      // at 0 in meta.json with no diagnostic) through a different door.
-      log(
-        `Warning: could not load cached embeddings ` +
-          `(${err?.message ?? String(err)}). ` +
-          `Embeddings will not be preserved on this run.`,
-      );
-      cachedEmbeddingNodeIds = new Set<string>();
-      cachedEmbeddings = [];
-      try {
-        const closeStart = Date.now();
-        await closeLbug();
-        profile.finalCloseMs += Date.now() - closeStart;
-      } catch {
-        /* swallow */
-      }
-    } finally {
-      profile.embeddingCacheLoadMs += Date.now() - embeddingCacheLoadStart;
-    }
-  }
-
-  // ── Load incremental parse cache ──────────────────────────────────
-  // Content-addressed: safe to reuse across `--force` runs (chunks whose
-  // file contents haven't changed produce identical worker output).
-  // Loaded into a single ParseCache object that the pipeline mutates
-  // in-place (cache hits leave entries unchanged; misses add new ones).
-  const parseCacheLoadStart = Date.now();
-  const parseCache = await loadParseCache(storagePath);
-  profile.parseCacheLoadMs = Date.now() - parseCacheLoadStart;
-
   // Compute current per-file content hashes from the same repository scan that
   // `gitnexus status` uses. Deriving hashes from graph File nodes let analyze
   // and status drift whenever generated files or non-symbol files were present.
@@ -536,6 +483,80 @@ export async function runFullAnalysis(
       log(`Incremental plan: mode=full reason=${incrementalPlan.reason}`);
     }
   }
+
+  if (
+    isIncremental &&
+    hashDiff &&
+    hashDiff.changed.length === 0 &&
+    hashDiff.added.length === 0 &&
+    hashDiff.deleted.length === 0
+  ) {
+    log('Already up to date');
+    if (isAnalyzeProfilingEnabled()) {
+      const totalAnalyzeMs = Date.now() - analyzeStart;
+      const accounted =
+        profile.preflightMs + profile.hashMs + profile.incrementalPlanningMs + profile.finalCloseMs;
+      log('Analyze profile:');
+      log('  fastPath: unchanged incremental');
+      log(
+        `  orchestration: preflight=${formatMs(profile.preflightMs)}, hash=${formatMs(profile.hashMs)}, incrementalPlanning=${formatMs(profile.incrementalPlanningMs)}, accounted=${formatMs(accounted)}, unaccounted=${formatMs(totalAnalyzeMs - accounted)}, total=${formatMs(totalAnalyzeMs)}`,
+      );
+    }
+    progress('done', 100, 'Already up to date');
+    return {
+      repoName:
+        options.registryName ??
+        getInferredRepoName(repoPath) ??
+        path.basename(resolveRepoIdentityRoot(repoPath)),
+      repoPath,
+      stats: existingMeta?.stats ?? {},
+      alreadyUpToDate: true,
+    };
+  }
+
+  // We load caches only after the no-change incremental fast path. A no-op
+  // analyze should not pay for parse-cache JSON reads or embedding preservation.
+  if (shouldLoadCache && existingMeta) {
+    const embeddingCacheLoadStart = Date.now();
+    try {
+      progress('embeddings', 0, 'Caching embeddings...');
+      const initStart = Date.now();
+      await initLbug(lbugPath);
+      profile.lbugInitMs += Date.now() - initStart;
+      const cached = await loadCachedEmbeddings();
+      cachedEmbeddingNodeIds = cached.embeddingNodeIds;
+      cachedEmbeddings = cached.embeddings;
+      const closeStart = Date.now();
+      await closeLbug();
+      profile.finalCloseMs += Date.now() - closeStart;
+    } catch (err: any) {
+      log(
+        `Warning: could not load cached embeddings ` +
+          `(${err?.message ?? String(err)}). ` +
+          `Embeddings will not be preserved on this run.`,
+      );
+      cachedEmbeddingNodeIds = new Set<string>();
+      cachedEmbeddings = [];
+      try {
+        const closeStart = Date.now();
+        await closeLbug();
+        profile.finalCloseMs += Date.now() - closeStart;
+      } catch {
+        /* swallow */
+      }
+    } finally {
+      profile.embeddingCacheLoadMs += Date.now() - embeddingCacheLoadStart;
+    }
+  }
+
+  // ── Load incremental parse cache ──────────────────────────────────
+  // Content-addressed: safe to reuse across `--force` runs (chunks whose
+  // file contents haven't changed produce identical worker output).
+  // Loaded into a single ParseCache object that the pipeline mutates
+  // in-place (cache hits leave entries unchanged; misses add new ones).
+  const parseCacheLoadStart = Date.now();
+  const parseCache = await loadParseCache(storagePath);
+  profile.parseCacheLoadMs = Date.now() - parseCacheLoadStart;
 
   const fileArtifactReplayStats = {
     artifactReplayEnabled: false,

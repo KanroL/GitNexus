@@ -84,6 +84,7 @@ export interface PipelineOptions {
   /** Optional per-language shared-finalize cache used only by scopeResolution. */
   scopeFinalizeCache?: {
     storagePath: string;
+    maxPatchFiles?: number;
   };
   partialScopeResolution?: {
     enabled: boolean;
@@ -100,6 +101,10 @@ export interface PartialScopeResolutionStats {
   scopePartialRawAffectedFiles: number;
   scopePartialMatchedAffectedFiles: number;
   scopePartialUnmatchedAffectedFiles?: string[];
+  scopeFinalizePatchedFiles: number;
+  scopeFinalizeReusedFiles: number;
+  scopeFinalizePatchEnabled: boolean;
+  scopeFinalizePatchDisabledReason?: string;
   scopeReferenceSitesResolved: number;
   scopeReferenceSitesTotal: number;
   scopeEmitFiles: number;
@@ -265,6 +270,10 @@ export const runPipelineFromRepo = async (
       partialRawAffectedFiles: scopeOutput.partialRawAffectedFiles,
       partialMatchedAffectedFiles: scopeOutput.partialMatchedAffectedFiles,
       partialUnmatchedAffectedFiles: scopeOutput.partialUnmatchedAffectedFiles,
+      finalizePatchedFiles: scopeOutput.finalizePatchedFiles,
+      finalizeReusedFiles: scopeOutput.finalizeReusedFiles,
+      finalizePatchEnabled: scopeOutput.finalizePatchEnabled,
+      finalizePatchDisabledReason: scopeOutput.finalizePatchDisabledReason,
       referenceSitesResolved: scopeOutput.referenceSitesResolved,
       referenceSitesTotal: scopeOutput.referenceSitesTotal,
       emitFiles: scopeOutput.emitFiles,

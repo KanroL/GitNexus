@@ -57,6 +57,10 @@ export interface PipelineResult {
     partialRawAffectedFiles: number;
     partialMatchedAffectedFiles: number;
     partialUnmatchedAffectedFiles: readonly string[];
+    finalizePatchedFiles: number;
+    finalizeReusedFiles: number;
+    finalizePatchEnabled: boolean;
+    finalizePatchDisabledReason?: string;
     referenceSitesResolved: number;
     referenceSitesTotal: number;
     emitFiles: number;

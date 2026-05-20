@@ -400,12 +400,9 @@ export function useValue(): string {
       expect(warm.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
 
       await writeFile(
-        path.join(repo.dbPath, 'src', 'consumer.ts'),
-        `import { value } from './provider';
-
-export function useValue(): string {
-  const next = value();
-  return next.toUpperCase();
+        path.join(repo.dbPath, 'src', 'provider.ts'),
+        `export function value(): string {
+  return 'v2';
 }
 `,
       );
@@ -420,6 +417,7 @@ export function useValue(): string {
       expect(cached.pipelineResult?.scopeStats.emitFiles).toBeLessThan(
         cached.pipelineResult!.scopeStats.filesResolved,
       );
+      expect(cached.pipelineResult?.scopeStats.partialAffectedFiles).toBeGreaterThanOrEqual(2);
     } finally {
       await repo.cleanup();
     }
@@ -717,7 +715,6 @@ export function useValue(): string {
         { ...analyzeOptions, force: true, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
         callbacks(),
       );
-
       const { storagePath } = getStoragePaths(repo.dbPath);
       const cacheDir = getFileArtifactCacheDir(storagePath);
       const index = JSON.parse(await readFile(path.join(cacheDir, 'index.json'), 'utf-8')) as {
@@ -743,7 +740,6 @@ export function useValue(): string {
       expect(incremental.pipelineResult?.parseStats.artifactShardReads).toBeGreaterThan(0);
       expect(incremental.pipelineResult?.parseStats.replayedFiles).toBeGreaterThan(0);
       expect(incremental.pipelineResult?.parseStats.parsedFiles).toBeGreaterThanOrEqual(2);
-
       const statusPaths = getStoragePaths(repo.dbPath);
       const meta = await loadMeta(statusPaths.storagePath);
       expect(meta).not.toBeNull();
@@ -755,6 +751,57 @@ export function useValue(): string {
         meta: meta!,
       });
       expect(report.isUpToDate).toBe(true);
+    } finally {
+      await closeLbug();
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('small replay scope misses patch the finalize cache instead of global finalize', async () => {
+    const repo = await setupWorkerArtifactRepo();
+    try {
+      await runFullAnalysis(
+        repo.dbPath,
+        { ...analyzeOptions, force: true, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
+        callbacks(),
+      );
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'artifact-2.ts'),
+        'export function artifact2(): number { return 200; }\n',
+      );
+      const warm = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      expect(warm.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
+
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      const cacheDir = getFileArtifactCacheDir(storagePath);
+      const index = JSON.parse(await readFile(path.join(cacheDir, 'index.json'), 'utf-8')) as {
+        artifacts: Array<{ filePath: string; shard: string }>;
+      };
+      const staleScopeArtifact = index.artifacts.find(
+        (artifact) => artifact.filePath === 'src/artifact-1.ts',
+      );
+      expect(staleScopeArtifact).toBeDefined();
+      const shardPath = path.join(cacheDir, staleScopeArtifact!.shard);
+      const shard = JSON.parse(await readFile(shardPath, 'utf-8')) as {
+        payload: { parsedFiles?: unknown[] };
+      };
+      shard.payload.parsedFiles = [];
+      await writeFile(shardPath, JSON.stringify(shard), 'utf-8');
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'artifact-0.ts'),
+        'export function artifact0(): number { return 100; }\n',
+      );
+      const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+
+      expect(incremental.pipelineResult?.parseStats.artifactReplayEnabled).toBe(true);
+      expect(incremental.pipelineResult?.parseStats.fileArtifactHits).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.scopeStats.finalizePatchEnabled).toBe(true);
+      expect(incremental.pipelineResult?.scopeStats.finalizePatchedFiles).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.scopeStats.finalizeReusedFiles).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.scopeStats.finalizeCacheHits).toBeGreaterThan(0);
+
+      await assertIncrementalMatchesForce(repo.dbPath);
     } finally {
       await closeLbug();
       await repo.cleanup();

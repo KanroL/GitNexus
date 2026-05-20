@@ -35,6 +35,7 @@ import type { ParseOutput } from '../../pipeline-phases/parse.js';
 import { isRegistryPrimary } from '../../registry-primary-flag.js';
 import { SupportedLanguages, getLanguageFromFilename } from 'gitnexus-shared';
 import { readFileContents } from '../../filesystem-walker.js';
+import { extractParsedFile } from '../../scope-extractor-bridge.js';
 import { runScopeResolution } from './run.js';
 import { SCOPE_RESOLVERS } from './registry.js';
 import type { ScopeResolver } from '../contract/scope-resolver.js';
@@ -49,6 +50,8 @@ import {
 } from '../../../../storage/scope-finalize-cache.js';
 
 import { logger } from '../../../logger.js';
+
+const DEFAULT_SCOPE_FINALIZE_PATCH_MAX_FILES = 16;
 
 const isUsableParsedFile = (value: unknown): value is import('gitnexus-shared').ParsedFile => {
   if (!value || typeof value !== 'object') return false;
@@ -159,6 +162,10 @@ export interface ScopeResolutionOutput {
   readonly partialRawAffectedFiles: number;
   readonly partialMatchedAffectedFiles: number;
   readonly partialUnmatchedAffectedFiles: readonly string[];
+  readonly finalizePatchedFiles: number;
+  readonly finalizeReusedFiles: number;
+  readonly finalizePatchEnabled: boolean;
+  readonly finalizePatchDisabledReason?: string;
   readonly referenceSitesResolved: number;
   readonly referenceSitesTotal: number;
   readonly emitFiles: number;
@@ -197,6 +204,10 @@ const NOOP_OUTPUT: ScopeResolutionOutput = Object.freeze({
   partialRawAffectedFiles: 0,
   partialMatchedAffectedFiles: 0,
   partialUnmatchedAffectedFiles: [],
+  finalizePatchedFiles: 0,
+  finalizeReusedFiles: 0,
+  finalizePatchEnabled: false,
+  finalizePatchDisabledReason: 'scope resolution did not run',
   referenceSitesResolved: 0,
   referenceSitesTotal: 0,
   emitFiles: 0,
@@ -265,6 +276,10 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
     let partialRawAffectedFiles = 0;
     let partialMatchedAffectedFiles = 0;
     let partialUnmatchedAffectedFiles: readonly string[] = [];
+    let finalizePatchedFiles = 0;
+    let finalizeReusedFiles = 0;
+    let finalizePatchEnabled = false;
+    let finalizePatchDisabledReason: string | undefined;
     let referenceSitesResolved = 0;
     let referenceSitesTotal = 0;
     let emitFiles = 0;
@@ -305,7 +320,9 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       const resolutionConfigHash = computeResolutionConfigHash(resolutionConfig);
       let cachedFinalizeOutput: ScopeFinalizeCachedOutput | undefined;
       let cacheMetadata: ReturnType<typeof buildScopeFinalizeCacheMetadata> | undefined;
+      let languageFinalizePatchedFiles = 0;
       const cacheStoragePath = ctx.options?.scopeFinalizeCache?.storagePath;
+      const maxPatchFiles = ctx.options?.scopeFinalizeCache?.maxPatchFiles ?? DEFAULT_SCOPE_FINALIZE_PATCH_MAX_FILES;
       if (cacheStoragePath === undefined) {
         finalizeCacheDisabledReason = 'scope finalize cache not enabled';
       }
@@ -313,16 +330,53 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       // Compute cache metadata only after extraction/replay inside runScopeResolution would
       // normally occur. To keep runScopeResolution synchronous, mirror the same validated
       // pre-extracted artifacts here for the cache decision by file path.
-      const currentParsedFiles: import('gitnexus-shared').ParsedFile[] = [];
+      const currentParsedByPath = new Map<string, import('gitnexus-shared').ParsedFile>();
       if (cacheStoragePath !== undefined) {
+        const missingPreExtractedFiles: { path: string; content: string }[] = [];
         for (const file of files) {
           const parsed = preExtractedByPath.get(file.path);
           if (parsed === undefined) {
-            finalizeCacheDisabledReason = 'missing pre-extracted parsed file';
-            break;
+            missingPreExtractedFiles.push(file);
+            continue;
           }
-          currentParsedFiles.push(parsed);
+          currentParsedByPath.set(file.path, parsed);
         }
+        if (missingPreExtractedFiles.length > 0) {
+          const unsafeReason =
+            lang !== SupportedLanguages.TypeScript
+              ? `language ${lang} not allowlisted`
+              : hasUnsupportedPartialScopeHook(provider);
+          if (unsafeReason !== undefined) {
+            finalizePatchDisabledReason = unsafeReason;
+          } else if (missingPreExtractedFiles.length > maxPatchFiles) {
+            finalizePatchDisabledReason = `missing pre-extracted files exceeded patch threshold (${missingPreExtractedFiles.length}/${maxPatchFiles})`;
+          } else if (ctx.options?.fileArtifactReplay?.stats.artifactReplayEnabled !== true) {
+            finalizePatchDisabledReason = 'artifact replay not enabled';
+          } else {
+            for (const file of missingPreExtractedFiles) {
+              const parsed = extractParsedFile(
+                provider.languageProvider,
+                file.content,
+                file.path,
+                (msg) => {
+                  if (isSemanticModelValidatorEnabled()) logger.warn(`[scope-resolution:${lang}] ${msg}`);
+                },
+                scopeTreeCache.get(file.path),
+              );
+              if (parsed === undefined) {
+                finalizePatchDisabledReason = `could not rebuild parsed file ${file.path}`;
+                break;
+              }
+              currentParsedByPath.set(file.path, parsed);
+            }
+          }
+          if (finalizePatchDisabledReason !== undefined) {
+            finalizeCacheDisabledReason = finalizePatchDisabledReason;
+          }
+        }
+        const currentParsedFiles = files
+          .map((file) => currentParsedByPath.get(file.path))
+          .filter((parsed): parsed is import('gitnexus-shared').ParsedFile => parsed !== undefined);
         if (currentParsedFiles.length === files.length) {
           for (const parsed of currentParsedFiles) provider.populateOwners(parsed);
           provider.populateWorkspaceOwners?.(currentParsedFiles, { fileContents: contents });
@@ -336,12 +390,24 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
           if (cached.hit === true) {
             cachedFinalizeOutput = cached.output;
             totalFinalizeCacheHits++;
+            if (missingPreExtractedFiles.length > 0) {
+              finalizePatchEnabled = true;
+              languageFinalizePatchedFiles = missingPreExtractedFiles.length;
+              finalizePatchedFiles += languageFinalizePatchedFiles;
+              finalizeReusedFiles += files.length - missingPreExtractedFiles.length;
+            }
           } else {
             totalFinalizeCacheMisses++;
             finalizeCacheDisabledReason = cached.reason;
+            if (missingPreExtractedFiles.length > 0) {
+              finalizePatchDisabledReason = cached.reason;
+            }
           }
         }
       }
+      const currentParsedFiles = files
+        .map((file) => currentParsedByPath.get(file.path))
+        .filter((parsed): parsed is import('gitnexus-shared').ParsedFile => parsed !== undefined);
 
       const stats = runScopeResolution(
         {
@@ -380,7 +446,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       emitFiles += stats.emitFiles;
       totalPreExtractedHits += stats.preExtractedHits;
       totalPreExtractedMisses += stats.preExtractedMisses;
-      totalFilesExtracted += stats.filesExtracted;
+      totalFilesExtracted += stats.filesExtracted + languageFinalizePatchedFiles;
       if (cacheStoragePath !== undefined && cacheMetadata !== undefined && !stats.finalizeCacheHit) {
         try {
           await saveScopeFinalizeCache(cacheStoragePath, cacheMetadata, stats.finalizeOutput);
@@ -425,6 +491,10 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       ctx.options.partialScopeResolution.stats.scopePartialRawAffectedFiles = partialRawAffectedFiles;
       ctx.options.partialScopeResolution.stats.scopePartialMatchedAffectedFiles = partialMatchedAffectedFiles;
       ctx.options.partialScopeResolution.stats.scopePartialUnmatchedAffectedFiles = [...partialUnmatchedAffectedFiles];
+      ctx.options.partialScopeResolution.stats.scopeFinalizePatchedFiles = finalizePatchedFiles;
+      ctx.options.partialScopeResolution.stats.scopeFinalizeReusedFiles = finalizeReusedFiles;
+      ctx.options.partialScopeResolution.stats.scopeFinalizePatchEnabled = finalizePatchEnabled;
+      ctx.options.partialScopeResolution.stats.scopeFinalizePatchDisabledReason = finalizePatchEnabled ? undefined : finalizePatchDisabledReason;
       ctx.options.partialScopeResolution.stats.scopeReferenceSitesResolved = referenceSitesResolved;
       ctx.options.partialScopeResolution.stats.scopeReferenceSitesTotal = referenceSitesTotal;
       ctx.options.partialScopeResolution.stats.scopeEmitFiles = emitFiles;
@@ -447,6 +517,10 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       partialRawAffectedFiles,
       partialMatchedAffectedFiles,
       partialUnmatchedAffectedFiles,
+      finalizePatchedFiles,
+      finalizeReusedFiles,
+      finalizePatchEnabled,
+      finalizePatchDisabledReason: finalizePatchEnabled ? undefined : finalizePatchDisabledReason,
       referenceSitesResolved,
       referenceSitesTotal,
       emitFiles,

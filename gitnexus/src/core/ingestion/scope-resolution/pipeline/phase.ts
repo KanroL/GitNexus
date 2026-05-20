@@ -73,7 +73,7 @@ const hasUnsupportedPartialScopeHook = (provider: ScopeResolver): string | undef
   return undefined;
 };
 
-const buildPartialScopeResolutionInput = (
+export const buildPartialScopeResolutionInput = (
   options: PipelineOptions | undefined,
   lang: SupportedLanguages,
   provider: ScopeResolver,
@@ -93,15 +93,15 @@ const buildPartialScopeResolutionInput = (
   if (lang !== SupportedLanguages.TypeScript) return setDisabled(`language ${lang} not allowlisted`);
   const unsupported = hasUnsupportedPartialScopeHook(provider);
   if (unsupported !== undefined) return setDisabled(unsupported);
-  if ((options.fileArtifactReplay?.stats.fileArtifactMisses ?? 0) > 0) {
-    return setDisabled('artifact replay had misses');
-  }
   if (options.fileArtifactReplay?.stats.artifactReplayEnabled !== true) {
     return setDisabled('artifact replay not enabled');
   }
   const languageFiles = new Set(files.map((file) => file.path));
   const affected = new Set<string>();
   for (const filePath of partial.affectedFiles) {
+    if (languageFiles.has(filePath)) affected.add(filePath);
+  }
+  for (const filePath of options.fileArtifactReplay?.stats.artifactMissFiles ?? []) {
     if (languageFiles.has(filePath)) affected.add(filePath);
   }
   if (affected.size === 0) return setDisabled('no affected files for language');

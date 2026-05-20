@@ -5,13 +5,17 @@ import {
   buildModuleScopeIndex,
   buildQualifiedNameIndex,
   buildScopeTree,
+  SupportedLanguages,
   type ReferenceSite,
   type Scope,
   type SymbolDefinition,
 } from 'gitnexus-shared';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
 import { resolveReferenceSites } from '../../src/core/ingestion/resolve-references.js';
+import type { PipelineOptions } from '../../src/core/ingestion/pipeline.js';
 import { emitImportEdges } from '../../src/core/ingestion/scope-resolution/graph-bridge/imports-to-edges.js';
+import type { ScopeResolver } from '../../src/core/ingestion/scope-resolution/contract/scope-resolver.js';
+import { buildPartialScopeResolutionInput } from '../../src/core/ingestion/scope-resolution/pipeline/phase.js';
 import type { ScopeResolutionIndexes } from '../../src/core/ingestion/model/scope-resolution-indexes.js';
 
 const range = { startLine: 1, startCol: 0, endLine: 1, endCol: 10 };
@@ -47,6 +51,55 @@ const indexesFor = (
 });
 
 describe('partial scope resolution', () => {
+  it('includes fresh artifact misses in the partial affected set', () => {
+    const stats = {
+      scopePartialEnabled: false,
+      scopePartialAffectedFiles: 0,
+      scopeReferenceSitesResolved: 0,
+      scopeReferenceSitesTotal: 0,
+      scopeEmitFiles: 0,
+    };
+    const options: PipelineOptions = {
+      fileArtifactReplay: {
+        storagePath: '/tmp/gitnexus-test',
+        currentFileHashes: new Map(),
+        freshFiles: new Set(),
+        stats: {
+          artifactReplayEnabled: true,
+          fileArtifactHits: 1,
+          fileArtifactMisses: 1,
+          artifactMissFiles: ['src/fresh.ts', 'src/ignored.py'],
+          replayedFiles: 1,
+          freshParsedFiles: 1,
+        },
+      },
+      partialScopeResolution: {
+        enabled: true,
+        affectedFiles: new Set(['src/changed.ts']),
+        stats,
+      },
+    };
+    const provider = {
+      language: SupportedLanguages.TypeScript,
+    } as ScopeResolver;
+
+    const partial = buildPartialScopeResolutionInput(
+      options,
+      SupportedLanguages.TypeScript,
+      provider,
+      [
+        { path: 'src/changed.ts', content: '' },
+        { path: 'src/fresh.ts', content: '' },
+      ],
+      true,
+    );
+
+    expect(partial?.disabledReason).toBeUndefined();
+    expect(partial?.sourceFiles).toEqual(new Set(['src/changed.ts', 'src/fresh.ts']));
+    expect(stats.scopePartialEnabled).toBe(true);
+    expect(stats.scopePartialAffectedFiles).toBe(2);
+  });
+
   it('resolves only selected source files while keeping global targets visible', () => {
     const targetDef: SymbolDefinition = { nodeId: 'Function:src/b.ts:foo', filePath: 'src/b.ts', type: 'Function' };
     const scopeA = moduleScope('src/a.ts');

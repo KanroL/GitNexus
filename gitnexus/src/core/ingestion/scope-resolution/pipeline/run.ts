@@ -23,7 +23,7 @@
  * Plan: `docs/plans/2026-04-20-001-refactor-emit-pipeline-generalization-plan.md`.
  */
 
-import type { ParsedFile, RegistryProviders } from 'gitnexus-shared';
+import type { BindingRef, ParsedFile, RegistryProviders, TypeRef } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
 import { reconcileOwnership, validateOwnershipParity } from './reconcile-ownership.js';
@@ -203,6 +203,25 @@ interface RunScopeResolutionStats {
 
 const elapsedMs = (start: bigint, end: bigint): number => Number(end - start) / 1_000_000;
 
+const asStringMap = <V>(value: unknown): ReadonlyMap<string, V> => {
+  if (!value || typeof value !== 'object') return new Map();
+  const entries = (value as { entries?: unknown }).entries;
+  if (typeof entries === 'function') return new Map(entries.call(value) as Iterable<[string, V]>);
+  const tagged = (value as Record<string, unknown>)['__$mapEntries$__'];
+  if (Array.isArray(tagged)) return new Map(tagged as [string, V][]);
+  if (Array.isArray(value)) return new Map(value as [string, V][]);
+  return new Map(Object.entries(value as Record<string, V>));
+};
+
+const normalizeParsedFileMaps = (parsed: ParsedFile): ParsedFile => ({
+  ...parsed,
+  scopes: parsed.scopes.map((scope) => ({
+    ...scope,
+    bindings: asStringMap<readonly BindingRef[]>(scope.bindings),
+    typeBindings: asStringMap<TypeRef>(scope.typeBindings),
+  })),
+});
+
 export function runScopeResolution(
   input: RunScopeResolutionInput,
   provider: ScopeResolver,
@@ -229,7 +248,7 @@ export function runScopeResolution(
   let preExtractedMisses = 0;
   let filesExtracted = 0;
   if (input.preparedParsedFiles !== undefined) {
-    parsedFiles.push(...input.preparedParsedFiles);
+    parsedFiles.push(...input.preparedParsedFiles.map(normalizeParsedFileMaps));
     preExtractedHits += input.preparedParsedFiles.length;
   } else {
     for (const file of files) {
@@ -257,6 +276,7 @@ export function runScopeResolution(
         }
         filesExtracted++;
       }
+      parsed = normalizeParsedFileMaps(parsed);
       provider.populateOwners(parsed);
       parsedFiles.push(parsed);
     }

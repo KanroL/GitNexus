@@ -227,6 +227,10 @@ interface AnalyzeProfileCounters {
   artifactMissReasons?: Record<string, number>;
   freshParseReasons?: Record<string, number>;
   artifactLanguageMetadataRecovered?: number;
+  artifactLoadMs?: number;
+  artifactIndexLoadMs?: number;
+  artifactShardLoadMs?: number;
+  artifactShardReads?: number;
   artifactMissFiles?: string[];
   replayedFiles: number;
   workerEligibleFiles?: number;
@@ -281,7 +285,7 @@ export const formatAnalyzeProfileLog = (
 ): string[] => [
   'Analyze profile:',
   `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, freshParsedFiles=${counters.freshParsedFiles ?? counters.parsedFiles}, workerEligibleFiles=${counters.workerEligibleFiles ?? counters.parsedFiles}, workerEligibleBytes=${counters.workerEligibleBytes ?? 0}, artifactReplay=${counters.artifactReplayEnabled ? (counters.artifactReplayMode ?? 'enabled') : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}, artifactLanguageMetadataRecovered=${counters.artifactLanguageMetadataRecovered ?? 0}`,
-  `  artifactReplayDetails: freshReasons=${formatCounterRecord(counters.freshParseReasons)}, missReasons=${formatCounterRecord(counters.artifactMissReasons)}, missSamples=${counters.artifactMissFiles?.slice(0, 10).join(',') || 'none'}`,
+  `  artifactReplayDetails: freshReasons=${formatCounterRecord(counters.freshParseReasons)}, missReasons=${formatCounterRecord(counters.artifactMissReasons)}, missSamples=${counters.artifactMissFiles?.slice(0, 10).join(',') || 'none'}, artifactLoad=${formatMs(counters.artifactLoadMs ?? 0)}, artifactIndexLoad=${formatMs(counters.artifactIndexLoadMs ?? 0)}, artifactShardLoad=${formatMs(counters.artifactShardLoadMs ?? 0)}, artifactShardReads=${counters.artifactShardReads ?? 0}`,
   `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}, scopeFinalizeCacheHit=${counters.scopeFinalizeCacheHits ?? 0}, scopeFinalizeCacheMiss=${counters.scopeFinalizeCacheMisses ?? 0}, scopeFinalizeCacheDisabledReason=${counters.scopeFinalizeCacheDisabledReason ?? 'none'}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
   `  scopeResolution: extract=${formatMs(timings.scopeExtractMs)}, finalize=${formatMs(timings.scopeFinalizeMs)}, propagate=${formatMs(timings.scopePropagateMs)}, resolve=${formatMs(timings.scopeResolveMs)}, emit=${formatMs(timings.scopeEmitMs)}`,
@@ -542,6 +546,10 @@ export async function runFullAnalysis(
     artifactMissReasons: {} as Record<string, number>,
     freshParseReasons: {} as Record<string, number>,
     artifactLanguageMetadataRecovered: 0,
+    artifactLoadMs: 0,
+    artifactIndexLoadMs: 0,
+    artifactShardLoadMs: 0,
+    artifactShardReads: 0,
     replayedFiles: 0,
     freshParsedFiles: 0,
   };

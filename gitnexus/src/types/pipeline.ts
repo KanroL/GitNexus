@@ -31,6 +31,10 @@ export interface PipelineResult {
     artifactMissReasons?: Record<string, number>;
     freshParseReasons?: Record<string, number>;
     artifactLanguageMetadataRecovered?: number;
+    artifactLoadMs?: number;
+    artifactIndexLoadMs?: number;
+    artifactShardLoadMs?: number;
+    artifactShardReads?: number;
     replayedFiles: number;
     workerEligibleFiles: number;
     workerEligibleBytes: number;

@@ -9,6 +9,7 @@ import {
   clearFileArtifactCache,
   getFileArtifactCacheDir,
   loadFileParseArtifact,
+  loadFileParseArtifactsBatchWithReason,
   loadFileParseArtifactWithReason,
   pruneFileArtifactCache,
   saveFileParseArtifact,
@@ -233,6 +234,36 @@ describe('file artifact cache', () => {
     });
   });
 
+  it('batch-loads multiple per-file artifacts', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        language: 'typescript',
+        payload: minimalResult({ nodes: [{ id: 'Function:src/a.ts:a', label: 'Function', properties: { filePath: 'src/a.ts' } } as any] }),
+      });
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/b.ts',
+        contentHash: 'hash-b',
+        language: 'typescript',
+        payload: minimalResult({ nodes: [{ id: 'Function:src/b.ts:b', label: 'Function', properties: { filePath: 'src/b.ts' } } as any] }),
+      });
+
+      const loaded = await loadFileParseArtifactsBatchWithReason(storagePath, [
+        { filePath: 'src/a.ts', contentHash: 'hash-a', language: 'typescript' },
+        { filePath: 'src/b.ts', contentHash: 'hash-b', language: 'typescript' },
+      ]);
+
+      expect(loaded.results.map((result) => result.status)).toEqual(['hit', 'hit']);
+      expect(loaded.stats.artifactShardReads).toBe(2);
+      expect(loaded.stats.artifactIndexLoadMs).toBeGreaterThanOrEqual(0);
+      if (loaded.results[0].status === 'hit' && loaded.results[1].status === 'hit') {
+        expect(loaded.results[0].artifact.payload.nodes[0]?.id).toBe('Function:src/a.ts:a');
+        expect(loaded.results[1].artifact.payload.nodes[0]?.id).toBe('Function:src/b.ts:b');
+      }
+    });
+  });
+
   it('loads legacy language-less artifacts when file path and content hash match', async () => {
     await withTempStorage(async (storagePath) => {
       await saveFileParseArtifact(storagePath, {
@@ -255,6 +286,27 @@ describe('file artifact cache', () => {
     });
   });
 
+  it('batch-loads legacy language-less artifacts when file path and content hash match', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        payload: minimalResult({ parsedFiles: [{ filePath: 'src/a.ts', scopes: [] }] as any }),
+      });
+
+      const loaded = await loadFileParseArtifactsBatchWithReason(storagePath, [
+        { filePath: 'src/a.ts', contentHash: 'hash-a', language: 'typescript' },
+      ]);
+
+      expect(loaded.results[0]?.status).toBe('hit');
+      const result = loaded.results[0];
+      if (result?.status === 'hit') {
+        expect(result.recoveredLanguageMetadata).toBe(true);
+        expect(result.artifact.language).toBeUndefined();
+      }
+    });
+  });
+
   it('rejects artifacts with an explicit wrong language', async () => {
     await withTempStorage(async (storagePath) => {
       await saveFileParseArtifact(storagePath, {
@@ -271,6 +323,24 @@ describe('file artifact cache', () => {
           language: 'typescript',
         }),
       ).resolves.toEqual({ status: 'miss', reason: 'language-mismatch' });
+    });
+  });
+
+  it('rejects artifacts with an explicit wrong language in batch', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        language: 'javascript',
+        payload: minimalResult(),
+      });
+
+      const loaded = await loadFileParseArtifactsBatchWithReason(storagePath, [
+        { filePath: 'src/a.ts', contentHash: 'hash-a', language: 'typescript' },
+      ]);
+
+      expect(loaded.results[0]).toEqual({ status: 'miss', reason: 'language-mismatch' });
+      expect(loaded.stats.artifactShardReads).toBe(0);
     });
   });
 
@@ -338,6 +408,26 @@ describe('file artifact cache', () => {
           language: 'typescript',
         }),
       ).resolves.toEqual({ status: 'miss', reason: 'missing-shard' });
+    });
+  });
+
+  it('reports a missing shard as a per-file batch miss', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        language: 'typescript',
+        payload: minimalResult(),
+      });
+      const [shard] = await shardPaths(storagePath);
+      await fs.rm(shard);
+
+      const loaded = await loadFileParseArtifactsBatchWithReason(storagePath, [
+        { filePath: 'src/a.ts', contentHash: 'hash-a', language: 'typescript' },
+      ]);
+
+      expect(loaded.results[0]).toEqual({ status: 'miss', reason: 'missing-shard' });
+      expect(loaded.stats.artifactShardReads).toBe(1);
     });
   });
 

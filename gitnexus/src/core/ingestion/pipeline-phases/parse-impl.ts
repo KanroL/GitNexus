@@ -20,9 +20,10 @@ import {
 import { processParsing, mergeChunkResults } from '../parsing-processor.js';
 import { fileContentHash, computeChunkHash } from '../../../storage/parse-cache.js';
 import {
-  loadFileParseArtifactWithReason,
+  loadFileParseArtifactsBatchWithReason,
   splitParseWorkerResultsByFile,
   type CapturedFileParseArtifact,
+  type LoadFileParseArtifactInput,
 } from '../../../storage/file-artifact-cache.js';
 import type { ParseWorkerResult } from '../workers/parse-worker.js';
 import type { WorkerExtractedData } from '../parsing-processor.js';
@@ -223,6 +224,10 @@ export async function runChunkedParseAndResolve(
     replayStats.artifactMissReasons = {};
     replayStats.freshParseReasons = {};
     replayStats.artifactLanguageMetadataRecovered = 0;
+    replayStats.artifactLoadMs = 0;
+    replayStats.artifactIndexLoadMs = 0;
+    replayStats.artifactShardLoadMs = 0;
+    replayStats.artifactShardReads = 0;
     replayStats.replayedFiles = 0;
     replayStats.freshParsedFiles = 0;
   }
@@ -248,6 +253,7 @@ export async function runChunkedParseAndResolve(
     }
     const replayRaw: ParseWorkerResult[] = [];
     const replayedPaths: string[] = [];
+    const replayLoadInputs: Array<{ file: ScannedFile; input: LoadFileParseArtifactInput }> = [];
     let disabledReason: string | undefined;
 
     for (const file of replayCandidates) {
@@ -261,28 +267,46 @@ export async function runChunkedParseAndResolve(
         freshFiles.push(file);
         continue;
       }
-      const artifactResult = await loadFileParseArtifactWithReason(replay.storagePath, {
-        filePath: file.path,
-        contentHash,
-        language,
+      replayLoadInputs.push({
+        file,
+        input: {
+          filePath: file.path,
+          contentHash,
+          language,
+        },
       });
-      if (artifactResult.status === 'miss') {
-        replay.stats.fileArtifactMisses++;
-        replay.stats.artifactMissFiles?.push(file.path);
-        incrementRecord(replay.stats.artifactMissReasons ??= {}, artifactResult.reason);
-        incrementRecord(replay.stats.freshParseReasons ??= {}, `artifact-${artifactResult.reason}`);
-        freshFiles.push(file);
-        continue;
-      }
-      if (artifactResult.recoveredLanguageMetadata) {
-        replay.stats.artifactLanguageMetadataRecovered =
-          (replay.stats.artifactLanguageMetadataRecovered ?? 0) + 1;
-      }
-      replay.stats.fileArtifactHits++;
-      replayRaw.push(artifactResult.artifact.payload);
-      replayedPaths.push(file.path);
     }
 
+    if (replayLoadInputs.length > 0) {
+      const artifactBatch = await loadFileParseArtifactsBatchWithReason(
+        replay.storagePath,
+        replayLoadInputs.map((item) => item.input),
+      );
+      replay.stats.artifactLoadMs = artifactBatch.stats.artifactLoadMs;
+      replay.stats.artifactIndexLoadMs = artifactBatch.stats.artifactIndexLoadMs;
+      replay.stats.artifactShardLoadMs = artifactBatch.stats.artifactShardLoadMs;
+      replay.stats.artifactShardReads = artifactBatch.stats.artifactShardReads;
+
+      for (let i = 0; i < replayLoadInputs.length; i++) {
+        const file = replayLoadInputs[i].file;
+        const artifactResult = artifactBatch.results[i];
+        if (artifactResult.status === 'miss') {
+          replay.stats.fileArtifactMisses++;
+          replay.stats.artifactMissFiles?.push(file.path);
+          incrementRecord(replay.stats.artifactMissReasons ??= {}, artifactResult.reason);
+          incrementRecord(replay.stats.freshParseReasons ??= {}, `artifact-${artifactResult.reason}`);
+          freshFiles.push(file);
+          continue;
+        }
+        if (artifactResult.recoveredLanguageMetadata) {
+          replay.stats.artifactLanguageMetadataRecovered =
+            (replay.stats.artifactLanguageMetadataRecovered ?? 0) + 1;
+        }
+        replay.stats.fileArtifactHits++;
+        replayRaw.push(artifactResult.artifact.payload);
+        replayedPaths.push(file.path);
+      }
+    }
     if (disabledReason) {
       replay.stats.artifactReplayEnabled = false;
       replay.stats.artifactReplayDisabledReason = disabledReason;

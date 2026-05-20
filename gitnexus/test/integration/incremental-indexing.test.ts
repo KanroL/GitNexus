@@ -729,6 +729,7 @@ export function useValue(): string {
       expect(incremental.pipelineResult?.parseStats.artifactReplayMode).toBe('partial');
       expect(incremental.pipelineResult?.parseStats.fileArtifactMisses).toBe(1);
       expect(incremental.pipelineResult?.parseStats.fileArtifactHits).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.parseStats.artifactShardReads).toBeGreaterThan(0);
       expect(incremental.pipelineResult?.parseStats.replayedFiles).toBeGreaterThan(0);
       expect(incremental.pipelineResult?.parseStats.parsedFiles).toBeGreaterThanOrEqual(2);
 

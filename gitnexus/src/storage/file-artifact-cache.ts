@@ -93,6 +93,18 @@ export type LoadFileParseArtifactResult =
   | { status: 'hit'; artifact: FileParseArtifact; recoveredLanguageMetadata: boolean }
   | { status: 'miss'; reason: FileParseArtifactLoadMissReason };
 
+export interface LoadFileParseArtifactsBatchStats {
+  artifactLoadMs: number;
+  artifactIndexLoadMs: number;
+  artifactShardLoadMs: number;
+  artifactShardReads: number;
+}
+
+export interface LoadFileParseArtifactsBatchResult {
+  results: LoadFileParseArtifactResult[];
+  stats: LoadFileParseArtifactsBatchStats;
+}
+
 interface FileArtifactCacheIndexEntry {
   filePath: string;
   contentHash: string;
@@ -126,6 +138,8 @@ const mapReviver = (_key: string, value: unknown): unknown => {
 
 const sha256Hex = (input: string): string => createHash('sha256').update(input).digest('hex');
 
+const elapsedMs = (start: bigint): number => Number(process.hrtime.bigint() - start) / 1_000_000;
+
 export const getFileArtifactCacheDir = (storagePath: string): string =>
   path.join(storagePath, CACHE_DIRNAME);
 
@@ -154,6 +168,8 @@ const emptyIndex = (): FileArtifactCacheIndex => ({
   version: FILE_ARTIFACT_CACHE_VERSION,
   artifacts: [],
 });
+
+const indexLookupKey = (filePath: string, contentHash: string): string => `${filePath}\0${contentHash}`;
 
 const isIndexEntry = (value: unknown): value is FileArtifactCacheIndexEntry => {
   if (!value || typeof value !== 'object') return false;
@@ -381,28 +397,20 @@ const saveIndex = async (storagePath: string, index: FileArtifactCacheIndex): Pr
   await fs.writeFile(getIndexPath(storagePath), JSON.stringify(index), 'utf-8');
 };
 
-export const loadFileParseArtifact = async (
-  storagePath: string,
+const selectCompatibleEntries = (
+  indexByFileHash: ReadonlyMap<string, readonly FileArtifactCacheIndexEntry[]>,
   input: LoadFileParseArtifactInput,
-): Promise<FileParseArtifact | null> => {
-  const result = await loadFileParseArtifactWithReason(storagePath, input);
-  return result.status === 'hit' ? result.artifact : null;
-};
-
-export const loadFileParseArtifactWithReason = async (
-  storagePath: string,
-  input: LoadFileParseArtifactInput,
-): Promise<LoadFileParseArtifactResult> => {
-  const loadedIndex = await loadIndexWithReason(storagePath);
-  if ('reason' in loadedIndex) return { status: 'miss', reason: loadedIndex.reason };
-
-  const candidates = loadedIndex.index.artifacts.filter(
-    (artifact) => artifact.filePath === input.filePath && artifact.contentHash === input.contentHash,
-  );
+):
+  | { status: 'entries'; entries: readonly FileArtifactCacheIndexEntry[] }
+  | { status: 'miss'; reason: FileParseArtifactLoadMissReason } => {
+  const candidates = indexByFileHash.get(indexLookupKey(input.filePath, input.contentHash)) ?? [];
   if (candidates.length === 0) return { status: 'miss', reason: 'missing-index-entry' };
 
   const languageCompatible = candidates.filter(
-    (artifact) => input.language === undefined || artifact.language === undefined || artifact.language === input.language,
+    (artifact) =>
+      input.language === undefined ||
+      artifact.language === undefined ||
+      artifact.language === input.language,
   );
   if (languageCompatible.length === 0) return { status: 'miss', reason: 'language-mismatch' };
 
@@ -410,8 +418,15 @@ export const loadFileParseArtifactWithReason = async (
     (artifact) => input.parserKey === undefined || artifact.parserKey === input.parserKey,
   );
   if (parserCompatible.length === 0) return { status: 'miss', reason: 'parser-key-mismatch' };
+  return { status: 'entries', entries: parserCompatible };
+};
 
-  for (const entry of parserCompatible) {
+const loadArtifactFromEntries = async (
+  storagePath: string,
+  input: LoadFileParseArtifactInput,
+  entries: readonly FileArtifactCacheIndexEntry[],
+): Promise<LoadFileParseArtifactResult> => {
+  for (const entry of entries) {
     const absShardPath = shardPath(storagePath, entry.shard);
     if (!absShardPath) continue;
     let parsed: FileParseArtifact;
@@ -444,6 +459,108 @@ export const loadFileParseArtifactWithReason = async (
   }
 
   return { status: 'miss', reason: 'missing-shard' };
+};
+
+const mapWithConcurrency = async <T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> => {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = next++;
+        if (index >= items.length) return;
+        results[index] = await fn(items[index], index);
+      }
+    }),
+  );
+  return results;
+};
+
+export const loadFileParseArtifact = async (
+  storagePath: string,
+  input: LoadFileParseArtifactInput,
+): Promise<FileParseArtifact | null> => {
+  const result = await loadFileParseArtifactWithReason(storagePath, input);
+  return result.status === 'hit' ? result.artifact : null;
+};
+
+export const loadFileParseArtifactWithReason = async (
+  storagePath: string,
+  input: LoadFileParseArtifactInput,
+): Promise<LoadFileParseArtifactResult> => {
+  const batch = await loadFileParseArtifactsBatchWithReason(storagePath, [input]);
+  return batch.results[0] ?? { status: 'miss', reason: 'missing-index-entry' };
+};
+
+export const loadFileParseArtifactsBatchWithReason = async (
+  storagePath: string,
+  inputs: readonly LoadFileParseArtifactInput[],
+  options?: { concurrency?: number },
+): Promise<LoadFileParseArtifactsBatchResult> => {
+  const totalStart = process.hrtime.bigint();
+  const indexStart = process.hrtime.bigint();
+  const loadedIndex = await loadIndexWithReason(storagePath);
+  const artifactIndexLoadMs = elapsedMs(indexStart);
+  if ('reason' in loadedIndex) {
+    return {
+      results: inputs.map(() => ({ status: 'miss', reason: loadedIndex.reason }) as const),
+      stats: {
+        artifactLoadMs: elapsedMs(totalStart),
+        artifactIndexLoadMs,
+        artifactShardLoadMs: 0,
+        artifactShardReads: 0,
+      },
+    };
+  }
+
+  const indexByFileHash = new Map<string, FileArtifactCacheIndexEntry[]>();
+  for (const entry of loadedIndex.index.artifacts) {
+    const key = indexLookupKey(entry.filePath, entry.contentHash);
+    let entries = indexByFileHash.get(key);
+    if (!entries) {
+      entries = [];
+      indexByFileHash.set(key, entries);
+    }
+    entries.push(entry);
+  }
+
+  const selected = inputs.map((input) => selectCompatibleEntries(indexByFileHash, input));
+  const results = new Array<LoadFileParseArtifactResult>(inputs.length);
+  let artifactShardReads = 0;
+  const shardJobs: Array<{ input: LoadFileParseArtifactInput; entries: readonly FileArtifactCacheIndexEntry[]; index: number }> = [];
+  for (let index = 0; index < selected.length; index++) {
+    const item = selected[index];
+    if (item.status === 'miss') {
+      results[index] = { status: 'miss', reason: item.reason };
+      continue;
+    }
+    artifactShardReads++;
+    shardJobs.push({ input: inputs[index], entries: item.entries, index });
+  }
+
+  const shardStart = process.hrtime.bigint();
+  const loadedArtifacts = await mapWithConcurrency(
+    shardJobs,
+    options?.concurrency ?? 32,
+    async (job) => ({ index: job.index, result: await loadArtifactFromEntries(storagePath, job.input, job.entries) }),
+  );
+  const artifactShardLoadMs = elapsedMs(shardStart);
+  for (const loaded of loadedArtifacts) results[loaded.index] = loaded.result;
+
+  return {
+    results,
+    stats: {
+      artifactLoadMs: elapsedMs(totalStart),
+      artifactIndexLoadMs,
+      artifactShardLoadMs,
+      artifactShardReads,
+    },
+  };
 };
 
 export const saveFileParseArtifact = async (

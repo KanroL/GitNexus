@@ -64,6 +64,8 @@ export interface ResolveReferencesInput {
   readonly scopes: ScopeResolutionIndexes;
   /** Provider hooks consumed by the registries (e.g. `arityCompatibility`). */
   readonly providers?: RegistryProviders;
+  /** Optional source-file filter for safe incremental re-resolution. */
+  readonly sourceFiles?: ReadonlySet<string>;
 }
 
 export interface ResolveStats {
@@ -86,6 +88,7 @@ export interface ResolveReferencesOutput {
 export function resolveReferenceSites(input: ResolveReferencesInput): ResolveReferencesOutput {
   const { scopes } = input;
   const providers: RegistryProviders = input.providers ?? {};
+  const sourceFiles = input.sourceFiles;
 
   const ctx: RegistryContext = {
     scopes: scopes.scopeTree,
@@ -109,6 +112,10 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
   let unresolved = 0;
 
   for (const site of scopes.referenceSites) {
+    if (sourceFiles !== undefined) {
+      const scope = scopes.scopeTree.getScope(site.inScope);
+      if (scope?.filePath === undefined || !sourceFiles.has(scope.filePath)) continue;
+    }
     sitesProcessed++;
 
     const resolutions = lookupForSite(site, classRegistry, methodRegistry, fieldRegistry);

@@ -22,6 +22,7 @@ export function emitImportEdges(
   imports: ReadonlyMap<ScopeId, readonly ImportEdge[]>,
   scopeTree: ScopeResolutionIndexes['scopeTree'],
   reason = 'scope-resolution: import',
+  sourceFiles?: ReadonlySet<string>,
 ): number {
   const seen = new Set<string>();
   let emitted = 0;
@@ -30,6 +31,7 @@ export function emitImportEdges(
     const scope = scopeTree.getScope(scopeId);
     if (scope === undefined) continue;
     const sourceFile = scope.filePath;
+    if (sourceFiles !== undefined && !sourceFiles.has(sourceFile)) continue;
 
     for (const edge of edges) {
       if (edge.targetFile === null) continue;

@@ -246,6 +246,12 @@ interface AnalyzeProfileCounters {
   scopeFinalizeCacheHits?: number;
   scopeFinalizeCacheMisses?: number;
   scopeFinalizeCacheDisabledReason?: string;
+  scopePartialEnabled?: boolean;
+  scopePartialDisabledReason?: string;
+  scopePartialAffectedFiles?: number;
+  scopeReferenceSitesResolved?: number;
+  scopeReferenceSitesTotal?: number;
+  scopeEmitFiles?: number;
 }
 
 export const isAnalyzeProfilingEnabled = (): boolean => process.env.GITNEXUS_VERBOSE === '1';
@@ -287,6 +293,7 @@ export const formatAnalyzeProfileLog = (
   `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, freshParsedFiles=${counters.freshParsedFiles ?? counters.parsedFiles}, workerEligibleFiles=${counters.workerEligibleFiles ?? counters.parsedFiles}, workerEligibleBytes=${counters.workerEligibleBytes ?? 0}, artifactReplay=${counters.artifactReplayEnabled ? (counters.artifactReplayMode ?? 'enabled') : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}, artifactLanguageMetadataRecovered=${counters.artifactLanguageMetadataRecovered ?? 0}`,
   `  artifactReplayDetails: freshReasons=${formatCounterRecord(counters.freshParseReasons)}, missReasons=${formatCounterRecord(counters.artifactMissReasons)}, missSamples=${counters.artifactMissFiles?.slice(0, 10).join(',') || 'none'}, artifactLoad=${formatMs(counters.artifactLoadMs ?? 0)}, artifactIndexLoad=${formatMs(counters.artifactIndexLoadMs ?? 0)}, artifactShardLoad=${formatMs(counters.artifactShardLoadMs ?? 0)}, artifactShardReads=${counters.artifactShardReads ?? 0}`,
   `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}, scopeFinalizeCacheHit=${counters.scopeFinalizeCacheHits ?? 0}, scopeFinalizeCacheMiss=${counters.scopeFinalizeCacheMisses ?? 0}, scopeFinalizeCacheDisabledReason=${counters.scopeFinalizeCacheDisabledReason ?? 'none'}`,
+  `  scopePartial: enabled=${counters.scopePartialEnabled === true}, disabledReason=${counters.scopePartialDisabledReason ?? 'none'}, affectedFiles=${counters.scopePartialAffectedFiles ?? 0}, referenceSitesResolved=${counters.scopeReferenceSitesResolved ?? 0}, referenceSitesTotal=${counters.scopeReferenceSitesTotal ?? 0}, emitFiles=${counters.scopeEmitFiles ?? 0}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
   `  scopeResolution: extract=${formatMs(timings.scopeExtractMs)}, finalize=${formatMs(timings.scopeFinalizeMs)}, propagate=${formatMs(timings.scopePropagateMs)}, resolve=${formatMs(timings.scopeResolveMs)}, emit=${formatMs(timings.scopeEmitMs)}`,
   `  db: writeback=${formatMs(timings.dbWritebackMs)}, init=${formatMs(timings.lbugInitMs)}, close=${formatMs(timings.finalCloseMs)}, dirtyMeta=${formatMs(timings.dirtyMetaMs)}, fullWipe=${formatMs(timings.fullWipeMs)}, writeSetPlanning=${formatMs(timings.writeSetPlanningMs)}, deleteRows=${formatMs(timings.deleteRowsMs)}, deleteGraphWide=${formatMs(timings.deleteGraphWideMs)}, subgraphExtract=${formatMs(timings.subgraphExtractMs)}, graphLoad=${formatMs(timings.graphLoadMs)}, validation=${formatMs(timings.validationMs)}, checkpointReopen=${formatMs(timings.checkpointReopenMs)}`,
@@ -554,7 +561,17 @@ export async function runFullAnalysis(
     freshParsedFiles: 0,
   };
 
+  const partialScopeResolutionStats = {
+    scopePartialEnabled: false,
+    scopePartialDisabledReason: undefined as string | undefined,
+    scopePartialAffectedFiles: 0,
+    scopeReferenceSitesResolved: 0,
+    scopeReferenceSitesTotal: 0,
+    scopeEmitFiles: 0,
+  };
+
   let incrementalFreshFiles: Set<string> | undefined;
+  let incrementalShadowCandidates: string[] = [];
   if (isIncremental && hashDiff) {
     const importerExpansionStart = Date.now();
     incrementalFreshFiles = new Set(hashDiff.toWrite);
@@ -568,6 +585,7 @@ export async function runFullAnalysis(
         }
       }
     }
+    incrementalShadowCandidates = shadowCandidates;
 
     try {
       const initStart = Date.now();
@@ -607,6 +625,22 @@ export async function runFullAnalysis(
 
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
   const pipelineStart = Date.now();
+  const partialScopeDisabledReason = !isIncremental
+    ? 'not incremental'
+    : !hashDiff
+      ? 'missing hash diff'
+      : !incrementalFreshFiles
+        ? 'incremental fresh set unavailable'
+        : hashDiff.added.length > 0
+          ? 'added files present'
+          : hashDiff.deleted.length > 0
+            ? 'deleted files present'
+            : incrementalShadowCandidates.length > 0
+              ? 'shadow candidates present'
+              : fileArtifactReplayStats.artifactReplayDisabledReason !== undefined
+                ? fileArtifactReplayStats.artifactReplayDisabledReason
+                : undefined;
+
   const pipelineResult = await runPipelineFromRepo(
     repoPath,
     (p) => {
@@ -632,6 +666,16 @@ export async function runFullAnalysis(
           }
         : {}),
       ...(isIncremental ? { scopeFinalizeCache: { storagePath } } : {}),
+      ...(isIncremental && hashDiff && incrementalFreshFiles
+        ? {
+            partialScopeResolution: {
+              enabled: partialScopeDisabledReason === undefined,
+              affectedFiles: incrementalFreshFiles,
+              disabledReason: partialScopeDisabledReason,
+              stats: partialScopeResolutionStats,
+            },
+          }
+        : {}),
     },
   );
   profile.pipelineMs = Date.now() - pipelineStart;
@@ -1251,6 +1295,12 @@ export async function runFullAnalysis(
           scopeFinalizeCacheMisses: pipelineResult.scopeStats?.finalizeCacheMisses ?? 0,
           scopeFinalizeCacheDisabledReason:
             pipelineResult.scopeStats?.finalizeCacheDisabledReason,
+          scopePartialEnabled: pipelineResult.scopeStats?.partialEnabled ?? false,
+          scopePartialDisabledReason: pipelineResult.scopeStats?.partialDisabledReason,
+          scopePartialAffectedFiles: pipelineResult.scopeStats?.partialAffectedFiles ?? 0,
+          scopeReferenceSitesResolved: pipelineResult.scopeStats?.referenceSitesResolved ?? 0,
+          scopeReferenceSitesTotal: pipelineResult.scopeStats?.referenceSitesTotal ?? 0,
+          scopeEmitFiles: pipelineResult.scopeStats?.emitFiles ?? 0,
         },
       );
       for (const line of profileLines) log(line);

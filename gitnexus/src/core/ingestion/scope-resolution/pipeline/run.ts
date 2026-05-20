@@ -167,6 +167,10 @@ interface RunScopeResolutionInput {
   /** Parsed files already extracted and owner-populated by the caller. */
   readonly preparedParsedFiles?: readonly ParsedFile[];
   readonly cachedFinalizeOutput?: SharedFinalizeOutput;
+  readonly partialResolution?: {
+    readonly sourceFiles: ReadonlySet<string>;
+    readonly disabledReason?: string;
+  };
 }
 
 interface RunScopeResolutionStats {
@@ -179,6 +183,11 @@ interface RunScopeResolutionStats {
   readonly resolve: ResolveStats;
   readonly referenceEdgesEmitted: number;
   readonly referenceSkipped: number;
+  readonly referenceSitesTotal: number;
+  readonly emitFiles: number;
+  readonly partialEnabled: boolean;
+  readonly partialDisabledReason?: string;
+  readonly partialAffectedFiles: number;
   readonly timings: {
     readonly extractMs: number;
     readonly finalizeMs: number;
@@ -283,6 +292,11 @@ export function runScopeResolution(
       resolve: { sitesProcessed: 0, referencesEmitted: 0, unresolved: 0 },
       referenceEdgesEmitted: 0,
       referenceSkipped: 0,
+      referenceSitesTotal: 0,
+      emitFiles: 0,
+      partialEnabled: false,
+      partialDisabledReason: 'no parsed files',
+      partialAffectedFiles: 0,
       timings: {
         extractMs: elapsedMs(tStart, tExtract),
         finalizeMs: 0,
@@ -405,9 +419,15 @@ export function runScopeResolution(
   const registryProviders: RegistryProviders = {
     arityCompatibility: provider.arityCompatibility,
   };
+  const partialSourceFiles = input.partialResolution?.sourceFiles;
+  const partialEnabled = partialSourceFiles !== undefined && partialSourceFiles.size > 0;
+  const emitParsedFiles = partialEnabled
+    ? parsedFiles.filter((parsed) => partialSourceFiles.has(parsed.filePath))
+    : parsedFiles;
   const { referenceIndex, stats: resolveStats } = resolveReferenceSites({
     scopes: indexes,
     providers: registryProviders,
+    ...(partialEnabled ? { sourceFiles: partialSourceFiles } : {}),
   });
   const tResolve = process.hrtime.bigint();
 
@@ -422,6 +442,7 @@ export function runScopeResolution(
     provider,
     workspaceIndex,
     readonlyModel,
+    partialEnabled ? partialSourceFiles : undefined,
   );
   const unresolvedReceiverExtras =
     provider.emitUnresolvedReceiverEdges !== undefined
@@ -450,6 +471,7 @@ export function runScopeResolution(
       resolveAdlCandidates: provider.resolveAdlCandidates,
       conversionRankFn: provider.conversionRankFn,
     },
+    partialEnabled ? partialSourceFiles : undefined,
   );
   const { emitted, skipped } = emitReferencesViaLookup(
     graph,
@@ -463,6 +485,7 @@ export function runScopeResolution(
     indexes.imports,
     indexes.scopeTree,
     provider.importEdgeReason,
+    partialEnabled ? partialSourceFiles : undefined,
   );
 
   const tEnd = process.hrtime.bigint();
@@ -496,6 +519,11 @@ export function runScopeResolution(
     resolve: resolveStats,
     referenceEdgesEmitted: emitted + receiverExtras + unresolvedReceiverExtras + freeCallExtras,
     referenceSkipped: skipped,
+    referenceSitesTotal: indexes.referenceSites.length,
+    emitFiles: emitParsedFiles.length,
+    partialEnabled,
+    partialDisabledReason: partialEnabled ? undefined : input.partialResolution?.disabledReason,
+    partialAffectedFiles: partialSourceFiles?.size ?? 0,
     timings,
     finalizeCacheHit: cachedFinalizeOutput !== undefined,
     finalizeCacheMiss: cachedFinalizeOutput === undefined,

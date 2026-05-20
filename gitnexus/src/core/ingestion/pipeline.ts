@@ -85,6 +85,21 @@ export interface PipelineOptions {
   scopeFinalizeCache?: {
     storagePath: string;
   };
+  partialScopeResolution?: {
+    enabled: boolean;
+    affectedFiles: ReadonlySet<string>;
+    disabledReason?: string;
+    stats: PartialScopeResolutionStats;
+  };
+}
+
+export interface PartialScopeResolutionStats {
+  scopePartialEnabled: boolean;
+  scopePartialDisabledReason?: string;
+  scopePartialAffectedFiles: number;
+  scopeReferenceSitesResolved: number;
+  scopeReferenceSitesTotal: number;
+  scopeEmitFiles: number;
 }
 
 export interface FileArtifactReplayStats {
@@ -241,6 +256,12 @@ export const runPipelineFromRepo = async (
       finalizeCacheHits: scopeOutput.finalizeCacheHits,
       finalizeCacheMisses: scopeOutput.finalizeCacheMisses,
       finalizeCacheDisabledReason: scopeOutput.finalizeCacheDisabledReason,
+      partialEnabled: scopeOutput.partialEnabled,
+      partialDisabledReason: scopeOutput.partialDisabledReason,
+      partialAffectedFiles: scopeOutput.partialAffectedFiles,
+      referenceSitesResolved: scopeOutput.referenceSitesResolved,
+      referenceSitesTotal: scopeOutput.referenceSitesTotal,
+      emitFiles: scopeOutput.emitFiles,
       extractMs: scopeOutput.timings.extractMs,
       finalizeMs: scopeOutput.timings.finalizeMs,
       propagateMs: scopeOutput.timings.propagateMs,

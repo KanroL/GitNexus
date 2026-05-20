@@ -51,6 +51,12 @@ export interface PipelineResult {
     finalizeCacheHits: number;
     finalizeCacheMisses: number;
     finalizeCacheDisabledReason?: string;
+    partialEnabled: boolean;
+    partialDisabledReason?: string;
+    partialAffectedFiles: number;
+    referenceSitesResolved: number;
+    referenceSitesTotal: number;
+    emitFiles: number;
     extractMs: number;
     finalizeMs: number;
     propagateMs: number;

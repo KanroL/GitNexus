@@ -67,11 +67,16 @@ export function emitFreeCallFallback(
     ) => readonly SymbolDefinition[] | undefined;
     readonly conversionRankFn?: ConversionRankFn;
   } = {},
+  sourceFiles?: ReadonlySet<string>,
 ): number {
   let emitted = 0;
   const seen = new Set<string>();
 
-  for (const parsed of parsedFiles) {
+  const emitParsedFiles = sourceFiles
+    ? parsedFiles.filter((parsed) => sourceFiles.has(parsed.filePath))
+    : parsedFiles;
+
+  for (const parsed of emitParsedFiles) {
     for (const site of parsed.referenceSites) {
       if (site.kind !== 'call') continue;
       if (site.explicitReceiver !== undefined) continue;

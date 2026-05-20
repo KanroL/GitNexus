@@ -412,6 +412,14 @@ export function useValue(): string {
       const cached = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
       expect(cached.alreadyUpToDate).toBeUndefined();
       expect(cached.pipelineResult?.scopeStats.finalizeCacheHits).toBeGreaterThan(0);
+      expect(cached.pipelineResult?.scopeStats.partialEnabled).toBe(true);
+      expect(cached.pipelineResult?.scopeStats.partialAffectedFiles).toBeGreaterThan(0);
+      expect(cached.pipelineResult?.scopeStats.referenceSitesResolved).toBeLessThanOrEqual(
+        cached.pipelineResult!.scopeStats.referenceSitesTotal,
+      );
+      expect(cached.pipelineResult?.scopeStats.emitFiles).toBeLessThan(
+        cached.pipelineResult!.scopeStats.filesResolved,
+      );
     } finally {
       await repo.cleanup();
     }
@@ -445,6 +453,7 @@ export function useValue(): string {
       const renamed = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
       expect(renamed.pipelineResult?.scopeStats.finalizeCacheHits ?? 0).toBe(0);
       expect(renamed.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
+      expect(renamed.pipelineResult?.scopeStats.partialEnabled).toBe(false);
     } finally {
       await repo.cleanup();
     }
@@ -549,7 +558,8 @@ export function useValue(): string {
     try {
       await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
       await rm(path.join(repo.dbPath, 'src', 'extra.ts'));
-      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      expect(incremental.pipelineResult?.scopeStats.partialEnabled).toBe(false);
       expect(await countNodesForPath(repo.dbPath, 'src/extra.ts')).toBe(0);
       await assertIncrementalMatchesForce(repo.dbPath);
     } finally {
@@ -727,6 +737,7 @@ export function useValue(): string {
 
       expect(incremental.pipelineResult?.parseStats.artifactReplayEnabled).toBe(true);
       expect(incremental.pipelineResult?.parseStats.artifactReplayMode).toBe('partial');
+      expect(incremental.pipelineResult?.scopeStats.partialEnabled).toBe(false);
       expect(incremental.pipelineResult?.parseStats.fileArtifactMisses).toBe(1);
       expect(incremental.pipelineResult?.parseStats.fileArtifactHits).toBeGreaterThan(0);
       expect(incremental.pipelineResult?.parseStats.artifactShardReads).toBeGreaterThan(0);

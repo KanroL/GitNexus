@@ -132,6 +132,7 @@ export function emitReceiverBoundCalls(
   provider: ReceiverBoundProviderSubset,
   index: WorkspaceResolutionIndex,
   model: SemanticModel,
+  sourceFiles?: ReadonlySet<string>,
 ): number {
   let emitted = 0;
   // Per-pass dedup so the multiple cases don't double-emit if two of
@@ -153,7 +154,11 @@ export function emitReceiverBoundCalls(
   // `parsedFiles.localDefs` lookup so downstream `findOwnedMember`
   // (which keys by DefId) can find the implementor's members.
   const graphIdToClassDef = new Map<string, SymbolDefinition>();
-  for (const parsed of parsedFiles) {
+  const emitParsedFiles = sourceFiles
+    ? parsedFiles.filter((parsed) => sourceFiles.has(parsed.filePath))
+    : parsedFiles;
+
+  for (const parsed of emitParsedFiles) {
     for (const def of parsed.localDefs) {
       if (def.type !== 'Class' && def.type !== 'Interface') continue;
       const graphId = resolveDefGraphId(parsed.filePath, def, nodeLookup);

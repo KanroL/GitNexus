@@ -36,6 +36,8 @@ import { SupportedLanguages, getLanguageFromFilename } from 'gitnexus-shared';
 import { readFileContents } from '../../filesystem-walker.js';
 import { runScopeResolution } from './run.js';
 import { SCOPE_RESOLVERS } from './registry.js';
+import type { ScopeResolver } from '../contract/scope-resolver.js';
+import type { PipelineOptions } from '../../pipeline.js';
 import { isDev, isSemanticModelValidatorEnabled } from '../../utils/env.js';
 import {
   buildScopeFinalizeCacheMetadata,
@@ -60,6 +62,55 @@ const isUsableParsedFile = (value: unknown): value is import('gitnexus-shared').
   );
 };
 
+const hasUnsupportedPartialScopeHook = (provider: ScopeResolver): string | undefined => {
+  if (provider.allowGlobalFreeCallFallback === true) return 'provider uses global free-call fallback';
+  if (provider.populateNamespaceSiblings !== undefined) return 'provider uses namespace sibling population';
+  if (provider.mirrorNamespaceTypeBindings !== undefined) return 'provider uses namespace type-binding mirroring';
+  if (provider.resolveAdlCandidates !== undefined) return 'provider uses ADL candidates';
+  if (provider.emitUnresolvedReceiverEdges !== undefined) return 'provider emits unresolved receiver edges';
+  if (provider.detectInterfaceImplementations !== undefined) return 'provider detects interface implementations';
+  if (provider.populateRangeBindings !== undefined) return 'provider uses range binding population';
+  return undefined;
+};
+
+const buildPartialScopeResolutionInput = (
+  options: PipelineOptions | undefined,
+  lang: SupportedLanguages,
+  provider: ScopeResolver,
+  files: readonly { path: string; content: string }[],
+  finalizeCacheHit: boolean,
+): { sourceFiles: ReadonlySet<string>; disabledReason?: string } | undefined => {
+  const partial = options?.partialScopeResolution;
+  const setDisabled = (reason: string): { sourceFiles: ReadonlySet<string>; disabledReason: string } => {
+    if (partial?.stats) {
+      partial.stats.scopePartialEnabled = false;
+      partial.stats.scopePartialDisabledReason = reason;
+    }
+    return { sourceFiles: new Set(), disabledReason: reason };
+  };
+  if (partial?.enabled !== true) return setDisabled(partial?.disabledReason ?? 'partial scope disabled');
+  if (finalizeCacheHit !== true) return setDisabled('scope finalize cache miss');
+  if (lang !== SupportedLanguages.TypeScript) return setDisabled(`language ${lang} not allowlisted`);
+  const unsupported = hasUnsupportedPartialScopeHook(provider);
+  if (unsupported !== undefined) return setDisabled(unsupported);
+  if ((options.fileArtifactReplay?.stats.fileArtifactMisses ?? 0) > 0) {
+    return setDisabled('artifact replay had misses');
+  }
+  if (options.fileArtifactReplay?.stats.artifactReplayEnabled !== true) {
+    return setDisabled('artifact replay not enabled');
+  }
+  const languageFiles = new Set(files.map((file) => file.path));
+  const affected = new Set<string>();
+  for (const filePath of partial.affectedFiles) {
+    if (languageFiles.has(filePath)) affected.add(filePath);
+  }
+  if (affected.size === 0) return setDisabled('no affected files for language');
+  partial.stats.scopePartialEnabled = true;
+  partial.stats.scopePartialDisabledReason = undefined;
+  partial.stats.scopePartialAffectedFiles += affected.size;
+  return { sourceFiles: affected };
+};
+
 export interface ScopeResolutionOutput {
   /** True when at least one language ran. */
   readonly ran: boolean;
@@ -75,6 +126,12 @@ export interface ScopeResolutionOutput {
   readonly finalizeCacheHits: number;
   readonly finalizeCacheMisses: number;
   readonly finalizeCacheDisabledReason?: string;
+  readonly partialEnabled: boolean;
+  readonly partialDisabledReason?: string;
+  readonly partialAffectedFiles: number;
+  readonly referenceSitesResolved: number;
+  readonly referenceSitesTotal: number;
+  readonly emitFiles: number;
   readonly timings: {
     readonly extractMs: number;
     readonly finalizeMs: number;
@@ -104,6 +161,12 @@ const NOOP_OUTPUT: ScopeResolutionOutput = Object.freeze({
   finalizeCacheHits: 0,
   finalizeCacheMisses: 0,
   finalizeCacheDisabledReason: 'scope resolution did not run',
+  partialEnabled: false,
+  partialDisabledReason: 'scope resolution did not run',
+  partialAffectedFiles: 0,
+  referenceSitesResolved: 0,
+  referenceSitesTotal: 0,
+  emitFiles: 0,
   timings: { extractMs: 0, finalizeMs: 0, propagateMs: 0, resolveMs: 0, emitMs: 0 },
   perLanguage: new Map(),
 });
@@ -163,6 +226,12 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
     let totalFinalizeCacheHits = 0;
     let totalFinalizeCacheMisses = 0;
     let finalizeCacheDisabledReason: string | undefined;
+    let partialEnabled = false;
+    let partialDisabledReason: string | undefined;
+    let partialAffectedFiles = 0;
+    let referenceSitesResolved = 0;
+    let referenceSitesTotal = 0;
+    let emitFiles = 0;
     const totalTimings = { extractMs: 0, finalizeMs: 0, propagateMs: 0, resolveMs: 0, emitMs: 0 };
     let anyRan = false;
     const perLanguage = new Map<
@@ -250,6 +319,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
             ? { preparedParsedFiles: currentParsedFiles }
             : {}),
           cachedFinalizeOutput,
+          partialResolution: buildPartialScopeResolutionInput(ctx.options, lang, provider, files, cachedFinalizeOutput !== undefined),
           onWarn: (msg) => {
             if (isSemanticModelValidatorEnabled()) {
               logger.warn(`[scope-resolution:${lang}] ${msg}`);
@@ -263,6 +333,12 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       totalFiles += stats.filesProcessed;
       totalImports += stats.importsEmitted;
       totalRefs += stats.referenceEdgesEmitted;
+      if (stats.partialEnabled) partialEnabled = true;
+      if (stats.partialDisabledReason !== undefined) partialDisabledReason = stats.partialDisabledReason;
+      partialAffectedFiles += stats.partialAffectedFiles;
+      referenceSitesResolved += stats.resolve.sitesProcessed;
+      referenceSitesTotal += stats.referenceSitesTotal;
+      emitFiles += stats.emitFiles;
       totalPreExtractedHits += stats.preExtractedHits;
       totalPreExtractedMisses += stats.preExtractedMisses;
       totalFilesExtracted += stats.filesExtracted;
@@ -301,6 +377,17 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
 
     if (!anyRan) return NOOP_OUTPUT;
 
+    if (ctx.options?.partialScopeResolution?.stats !== undefined) {
+      ctx.options.partialScopeResolution.stats.scopePartialEnabled = partialEnabled;
+      ctx.options.partialScopeResolution.stats.scopePartialDisabledReason = partialEnabled
+        ? undefined
+        : (partialDisabledReason ?? ctx.options.partialScopeResolution.disabledReason ?? 'partial scope disabled');
+      ctx.options.partialScopeResolution.stats.scopePartialAffectedFiles = partialAffectedFiles;
+      ctx.options.partialScopeResolution.stats.scopeReferenceSitesResolved = referenceSitesResolved;
+      ctx.options.partialScopeResolution.stats.scopeReferenceSitesTotal = referenceSitesTotal;
+      ctx.options.partialScopeResolution.stats.scopeEmitFiles = emitFiles;
+    }
+
     return {
       ran: true,
       filesProcessed: totalFiles,
@@ -312,6 +399,12 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       finalizeCacheHits: totalFinalizeCacheHits,
       finalizeCacheMisses: totalFinalizeCacheMisses,
       finalizeCacheDisabledReason,
+      partialEnabled,
+      partialDisabledReason,
+      partialAffectedFiles,
+      referenceSitesResolved,
+      referenceSitesTotal,
+      emitFiles,
       timings: totalTimings,
       perLanguage,
     };

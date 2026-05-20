@@ -209,9 +209,11 @@ export async function runChunkedParseAndResolve(
   const replayStats = options?.fileArtifactReplay?.stats;
   if (replayStats) {
     replayStats.artifactReplayEnabled = false;
+    replayStats.artifactReplayMode = 'disabled';
     replayStats.artifactReplayDisabledReason = undefined;
     replayStats.fileArtifactHits = 0;
     replayStats.fileArtifactMisses = 0;
+    replayStats.artifactMissFiles = [];
     replayStats.replayedFiles = 0;
     replayStats.freshParsedFiles = 0;
   }
@@ -222,16 +224,19 @@ export async function runChunkedParseAndResolve(
   if (options?.fileArtifactReplay && totalParseable > 0) {
     const replay = options.fileArtifactReplay;
     const { freshCandidates, replayCandidates } = splitFreshAndReplayFiles(parseableScanned, replay);
+    const freshFiles = [...freshCandidates];
     const replayRaw: ParseWorkerResult[] = [];
+    const replayedPaths: string[] = [];
     let disabledReason: string | undefined;
 
     for (const file of replayCandidates) {
       const contentHash = replay.currentFileHashes.get(file.path);
       const language = getLanguageFromFilename(file.path);
       if (!contentHash || !language) {
-        disabledReason = `missing current hash/language for ${file.path}`;
         replay.stats.fileArtifactMisses++;
-        break;
+        replay.stats.artifactMissFiles?.push(file.path);
+        freshFiles.push(file);
+        continue;
       }
       const artifact = await loadFileParseArtifact(replay.storagePath, {
         filePath: file.path,
@@ -239,12 +244,14 @@ export async function runChunkedParseAndResolve(
         language,
       });
       if (!artifact) {
-        disabledReason = `missing or invalid artifact for ${file.path}`;
         replay.stats.fileArtifactMisses++;
-        break;
+        replay.stats.artifactMissFiles?.push(file.path);
+        freshFiles.push(file);
+        continue;
       }
       replay.stats.fileArtifactHits++;
       replayRaw.push(artifact.payload);
+      replayedPaths.push(file.path);
     }
 
     if (disabledReason) {
@@ -255,19 +262,29 @@ export async function runChunkedParseAndResolve(
       activeParseableScanned = parseableScanned;
       if (isDev) logger.info(`📦 file-artifact replay disabled: ${disabledReason}`);
     } else {
-      replay.stats.artifactReplayEnabled = true;
-      replay.stats.replayedFiles = replayCandidates.length;
-      replay.stats.freshParsedFiles = freshCandidates.length;
-      activeParseableScanned = freshCandidates;
+      replay.stats.replayedFiles = replay.stats.fileArtifactHits;
+      const freshByPath = new Map(freshFiles.map((file) => [file.path, file] as const));
+      const dedupedFreshFiles = [...freshByPath.values()];
+      replay.stats.freshParsedFiles = dedupedFreshFiles.length;
+      activeParseableScanned = dedupedFreshFiles;
+      replay.stats.artifactReplayEnabled = replayRaw.length > 0;
+      replay.stats.artifactReplayMode = replayRaw.length > 0
+        ? dedupedFreshFiles.length > 0
+          ? 'partial'
+          : 'full'
+        : 'disabled';
+      if (replayRaw.length === 0) {
+        replay.stats.artifactReplayDisabledReason = 'no valid replay artifacts';
+      }
       if (replayRaw.length > 0) {
         replayChunks.push({
-          paths: replayCandidates.map((f) => f.path),
+          paths: replayedPaths,
           replayRaw,
         });
       }
       if (isDev) {
         logger.info(
-          `📦 file-artifact replay enabled: ${replayCandidates.length} replayed, ${freshCandidates.length} fresh`,
+          `📦 file-artifact replay ${replay.stats.artifactReplayMode}: ${replay.stats.replayedFiles} replayed, ${dedupedFreshFiles.length} fresh`,
         );
       }
     }

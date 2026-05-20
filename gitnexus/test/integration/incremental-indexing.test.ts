@@ -694,4 +694,54 @@ export function useValue(): string {
       await repo.cleanup();
     }
   }, 600_000);
+
+  it('warm incremental parses missing artifact files fresh without disabling replay', async () => {
+    const repo = await setupWorkerArtifactRepo();
+    try {
+      await runFullAnalysis(
+        repo.dbPath,
+        { ...analyzeOptions, force: true, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
+        callbacks(),
+      );
+
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      const cacheDir = getFileArtifactCacheDir(storagePath);
+      const index = JSON.parse(await readFile(path.join(cacheDir, 'index.json'), 'utf-8')) as {
+        artifacts: Array<{ filePath: string; shard: string }>;
+      };
+      const missingArtifact = index.artifacts.find(
+        (artifact) => artifact.filePath === 'src/artifact-1.ts',
+      );
+      expect(missingArtifact).toBeDefined();
+      await rm(path.join(cacheDir, missingArtifact!.shard));
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'artifact-0.ts'),
+        'export function artifact0(): number { return 100; }\n',
+      );
+      const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+
+      expect(incremental.pipelineResult?.parseStats.artifactReplayEnabled).toBe(true);
+      expect(incremental.pipelineResult?.parseStats.artifactReplayMode).toBe('partial');
+      expect(incremental.pipelineResult?.parseStats.fileArtifactMisses).toBe(1);
+      expect(incremental.pipelineResult?.parseStats.fileArtifactHits).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.parseStats.replayedFiles).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.parseStats.parsedFiles).toBeGreaterThanOrEqual(2);
+
+      const statusPaths = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(statusPaths.storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath: statusPaths.storagePath,
+        lbugPath: statusPaths.lbugPath,
+        metaPath: statusPaths.metaPath,
+        meta: meta!,
+      });
+      expect(report.isUpToDate).toBe(true);
+    } finally {
+      await closeLbug();
+      await repo.cleanup();
+    }
+  }, 600_000);
 });

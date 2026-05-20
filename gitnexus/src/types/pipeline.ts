@@ -28,7 +28,9 @@ export interface PipelineResult {
     fileArtifactHits: number;
     fileArtifactMisses: number;
     replayedFiles: number;
+    freshParsedFiles: number;
     artifactReplayEnabled: boolean;
+    artifactReplayMode?: 'disabled' | 'full' | 'partial';
     artifactReplayDisabledReason?: string;
   };
   scopeStats: {

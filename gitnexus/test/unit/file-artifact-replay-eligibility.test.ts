@@ -35,7 +35,7 @@ describe('file artifact replay eligibility', () => {
     expect(result.replayCandidates.map((file) => file.path)).toEqual(['src/unchanged.ts']);
   });
 
-  it('keeps unchanged files in the replay set so missing artifacts disable replay safely', () => {
+  it('keeps unchanged files in the replay set so artifact lookup can replay or miss per file', () => {
     const result = splitFreshAndReplayFiles(files('src/unchanged.ts'), {
       currentFileHashes: new Map([['src/unchanged.ts', 'same']]),
       priorFileHashes: { 'src/unchanged.ts': 'same' },

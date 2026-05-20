@@ -225,7 +225,9 @@ interface AnalyzeProfileCounters {
   fileArtifactHits: number;
   fileArtifactMisses: number;
   replayedFiles: number;
+  freshParsedFiles?: number;
   artifactReplayEnabled: boolean;
+  artifactReplayMode?: 'disabled' | 'full' | 'partial';
   artifactReplayDisabledReason?: string;
   scopePreExtractedHits?: number;
   scopePreExtractedMisses?: number;
@@ -264,7 +266,7 @@ export const formatAnalyzeProfileLog = (
   counters: AnalyzeProfileCounters,
 ): string[] => [
   'Analyze profile:',
-  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, artifactReplay=${counters.artifactReplayEnabled ? 'enabled' : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}`,
+  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, freshParsedFiles=${counters.freshParsedFiles ?? counters.parsedFiles}, artifactReplay=${counters.artifactReplayEnabled ? (counters.artifactReplayMode ?? 'enabled') : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}`,
   `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}, scopeFinalizeCacheHit=${counters.scopeFinalizeCacheHits ?? 0}, scopeFinalizeCacheMiss=${counters.scopeFinalizeCacheMisses ?? 0}, scopeFinalizeCacheDisabledReason=${counters.scopeFinalizeCacheDisabledReason ?? 'none'}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
   `  scopeResolution: extract=${formatMs(timings.scopeExtractMs)}, finalize=${formatMs(timings.scopeFinalizeMs)}, propagate=${formatMs(timings.scopePropagateMs)}, resolve=${formatMs(timings.scopeResolveMs)}, emit=${formatMs(timings.scopeEmitMs)}`,
@@ -517,9 +519,11 @@ export async function runFullAnalysis(
 
   const fileArtifactReplayStats = {
     artifactReplayEnabled: false,
+    artifactReplayMode: 'disabled' as const,
     artifactReplayDisabledReason: isIncremental ? undefined : incrementalPlan.reason,
     fileArtifactHits: 0,
     fileArtifactMisses: 0,
+    artifactMissFiles: [] as string[],
     replayedFiles: 0,
     freshParsedFiles: 0,
   };
@@ -608,10 +612,10 @@ export async function runFullAnalysis(
 
   if (isAnalyzeProfilingEnabled()) {
     const reason = pipelineResult.parseStats.artifactReplayEnabled
-      ? 'enabled'
+      ? (pipelineResult.parseStats.artifactReplayMode ?? 'enabled')
       : `disabled: ${pipelineResult.parseStats.artifactReplayDisabledReason ?? fileArtifactReplayStats.artifactReplayDisabledReason ?? 'not attempted'}`;
     log(
-      `File artifact replay: ${reason}, hits=${pipelineResult.parseStats.fileArtifactHits}, misses=${pipelineResult.parseStats.fileArtifactMisses}, replayed=${pipelineResult.parseStats.replayedFiles}, freshParsed=${pipelineResult.parseStats.parsedFiles}`,
+      `File artifact replay: ${reason}, hits=${pipelineResult.parseStats.fileArtifactHits}, misses=${pipelineResult.parseStats.fileArtifactMisses}, replayed=${pipelineResult.parseStats.replayedFiles}, freshParsed=${pipelineResult.parseStats.freshParsedFiles}`,
     );
   }
 
@@ -1062,7 +1066,9 @@ export async function runFullAnalysis(
         isIncremental &&
         pipelineResult.parseStats?.artifactReplayEnabled === true &&
         incrementalFreshFiles !== undefined;
-      const artifactSaveSet = shouldLimitArtifactSave ? incrementalFreshFiles : undefined;
+      const artifactSaveSet = shouldLimitArtifactSave
+        ? new Set([...incrementalFreshFiles, ...(fileArtifactReplayStats.artifactMissFiles ?? [])])
+        : undefined;
       const inputs = [];
       for (const artifact of artifacts) {
         if (artifactSaveSet !== undefined && !artifactSaveSet.has(artifact.filePath)) continue;
@@ -1205,7 +1211,9 @@ export async function runFullAnalysis(
             fileArtifactHits: 0,
             fileArtifactMisses: 0,
             replayedFiles: 0,
+            freshParsedFiles: 0,
             artifactReplayEnabled: false,
+            artifactReplayMode: 'disabled' as const,
           }),
           scopePreExtractedHits: pipelineResult.scopeStats?.preExtractedHits ?? 0,
           scopePreExtractedMisses: pipelineResult.scopeStats?.preExtractedMisses ?? 0,

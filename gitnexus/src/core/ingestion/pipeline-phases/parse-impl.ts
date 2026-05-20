@@ -20,7 +20,7 @@ import {
 import { processParsing, mergeChunkResults } from '../parsing-processor.js';
 import { fileContentHash, computeChunkHash } from '../../../storage/parse-cache.js';
 import {
-  loadFileParseArtifact,
+  loadFileParseArtifactWithReason,
   splitParseWorkerResultsByFile,
   type CapturedFileParseArtifact,
 } from '../../../storage/file-artifact-cache.js';
@@ -101,6 +101,10 @@ const CHUNK_BYTE_BUDGET = (() => {
 type ScannedFile = { path: string; size: number };
 type ParseChunk = { paths: string[]; replayRaw?: ParseWorkerResult[] };
 type ProgressFn = (progress: PipelineProgress) => void;
+
+const incrementRecord = (record: Record<string, number>, key: string): void => {
+  record[key] = (record[key] ?? 0) + 1;
+};
 
 export const splitFreshAndReplayFiles = (
   parseableScanned: readonly ScannedFile[],
@@ -214,6 +218,9 @@ export async function runChunkedParseAndResolve(
     replayStats.fileArtifactHits = 0;
     replayStats.fileArtifactMisses = 0;
     replayStats.artifactMissFiles = [];
+    replayStats.artifactMissReasons = {};
+    replayStats.freshParseReasons = {};
+    replayStats.artifactLanguageMetadataRecovered = 0;
     replayStats.replayedFiles = 0;
     replayStats.freshParsedFiles = 0;
   }
@@ -225,6 +232,18 @@ export async function runChunkedParseAndResolve(
     const replay = options.fileArtifactReplay;
     const { freshCandidates, replayCandidates } = splitFreshAndReplayFiles(parseableScanned, replay);
     const freshFiles = [...freshCandidates];
+    for (const file of freshCandidates) {
+      const currentHash = replay.currentFileHashes.get(file.path);
+      const priorHash = replay.priorFileHashes?.[file.path];
+      const reason = replay.freshFiles.has(file.path)
+        ? 'importer-expanded-or-shadow'
+        : !priorHash
+          ? 'added'
+          : !currentHash || currentHash !== priorHash
+            ? 'changed'
+            : 'fresh-candidate';
+      incrementRecord(replay.stats.freshParseReasons ??= {}, reason);
+    }
     const replayRaw: ParseWorkerResult[] = [];
     const replayedPaths: string[] = [];
     let disabledReason: string | undefined;
@@ -235,22 +254,30 @@ export async function runChunkedParseAndResolve(
       if (!contentHash || !language) {
         replay.stats.fileArtifactMisses++;
         replay.stats.artifactMissFiles?.push(file.path);
+        incrementRecord(replay.stats.artifactMissReasons ??= {}, 'unparseable-replay-candidate');
+        incrementRecord(replay.stats.freshParseReasons ??= {}, 'artifact-unavailable');
         freshFiles.push(file);
         continue;
       }
-      const artifact = await loadFileParseArtifact(replay.storagePath, {
+      const artifactResult = await loadFileParseArtifactWithReason(replay.storagePath, {
         filePath: file.path,
         contentHash,
         language,
       });
-      if (!artifact) {
+      if (artifactResult.status === 'miss') {
         replay.stats.fileArtifactMisses++;
         replay.stats.artifactMissFiles?.push(file.path);
+        incrementRecord(replay.stats.artifactMissReasons ??= {}, artifactResult.reason);
+        incrementRecord(replay.stats.freshParseReasons ??= {}, `artifact-${artifactResult.reason}`);
         freshFiles.push(file);
         continue;
       }
+      if (artifactResult.recoveredLanguageMetadata) {
+        replay.stats.artifactLanguageMetadataRecovered =
+          (replay.stats.artifactLanguageMetadataRecovered ?? 0) + 1;
+      }
       replay.stats.fileArtifactHits++;
-      replayRaw.push(artifact.payload);
+      replayRaw.push(artifactResult.artifact.payload);
       replayedPaths.push(file.path);
     }
 

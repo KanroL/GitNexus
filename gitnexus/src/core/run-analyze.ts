@@ -224,6 +224,10 @@ interface AnalyzeProfileCounters {
   parsedFiles: number;
   fileArtifactHits: number;
   fileArtifactMisses: number;
+  artifactMissReasons?: Record<string, number>;
+  freshParseReasons?: Record<string, number>;
+  artifactLanguageMetadataRecovered?: number;
+  artifactMissFiles?: string[];
   replayedFiles: number;
   freshParsedFiles?: number;
   artifactReplayEnabled: boolean;
@@ -241,6 +245,14 @@ interface AnalyzeProfileCounters {
 export const isAnalyzeProfilingEnabled = (): boolean => process.env.GITNEXUS_VERBOSE === '1';
 
 const formatMs = (ms: number): string => `${Math.max(0, Math.round(ms))}ms`;
+
+const formatCounterRecord = (record: Record<string, number> | undefined): string => {
+  if (!record) return 'none';
+  const entries = Object.entries(record)
+    .filter(([, count]) => count > 0)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(',') : 'none';
+};
 
 const sumProfileMajorTimings = (timings: AnalyzeProfileTimings): number =>
   timings.preflightMs +
@@ -266,7 +278,8 @@ export const formatAnalyzeProfileLog = (
   counters: AnalyzeProfileCounters,
 ): string[] => [
   'Analyze profile:',
-  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, freshParsedFiles=${counters.freshParsedFiles ?? counters.parsedFiles}, artifactReplay=${counters.artifactReplayEnabled ? (counters.artifactReplayMode ?? 'enabled') : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}`,
+  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, freshParsedFiles=${counters.freshParsedFiles ?? counters.parsedFiles}, artifactReplay=${counters.artifactReplayEnabled ? (counters.artifactReplayMode ?? 'enabled') : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}, artifactLanguageMetadataRecovered=${counters.artifactLanguageMetadataRecovered ?? 0}`,
+  `  artifactReplayDetails: freshReasons=${formatCounterRecord(counters.freshParseReasons)}, missReasons=${formatCounterRecord(counters.artifactMissReasons)}, missSamples=${counters.artifactMissFiles?.slice(0, 10).join(',') || 'none'}`,
   `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}, scopeFinalizeCacheHit=${counters.scopeFinalizeCacheHits ?? 0}, scopeFinalizeCacheMiss=${counters.scopeFinalizeCacheMisses ?? 0}, scopeFinalizeCacheDisabledReason=${counters.scopeFinalizeCacheDisabledReason ?? 'none'}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
   `  scopeResolution: extract=${formatMs(timings.scopeExtractMs)}, finalize=${formatMs(timings.scopeFinalizeMs)}, propagate=${formatMs(timings.scopePropagateMs)}, resolve=${formatMs(timings.scopeResolveMs)}, emit=${formatMs(timings.scopeEmitMs)}`,
@@ -524,6 +537,9 @@ export async function runFullAnalysis(
     fileArtifactHits: 0,
     fileArtifactMisses: 0,
     artifactMissFiles: [] as string[],
+    artifactMissReasons: {} as Record<string, number>,
+    freshParseReasons: {} as Record<string, number>,
+    artifactLanguageMetadataRecovered: 0,
     replayedFiles: 0,
     freshParsedFiles: 0,
   };

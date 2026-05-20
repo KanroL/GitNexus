@@ -94,6 +94,9 @@ export interface FileArtifactReplayStats {
   fileArtifactHits: number;
   fileArtifactMisses: number;
   artifactMissFiles?: string[];
+  artifactMissReasons?: Record<string, number>;
+  freshParseReasons?: Record<string, number>;
+  artifactLanguageMetadataRecovered?: number;
   replayedFiles: number;
   freshParsedFiles: number;
 }
@@ -206,6 +209,11 @@ export const runPipelineFromRepo = async (
       parsedFiles: parseOutput.parsedFilesCount,
       fileArtifactHits: options?.fileArtifactReplay?.stats.fileArtifactHits ?? 0,
       fileArtifactMisses: options?.fileArtifactReplay?.stats.fileArtifactMisses ?? 0,
+      artifactMissFiles: options?.fileArtifactReplay?.stats.artifactMissFiles,
+      artifactMissReasons: options?.fileArtifactReplay?.stats.artifactMissReasons,
+      freshParseReasons: options?.fileArtifactReplay?.stats.freshParseReasons,
+      artifactLanguageMetadataRecovered:
+        options?.fileArtifactReplay?.stats.artifactLanguageMetadataRecovered,
       replayedFiles: parseOutput.replayedFiles,
       freshParsedFiles: options?.fileArtifactReplay?.stats.freshParsedFiles ?? parseOutput.parsedFilesCount,
       artifactReplayEnabled: options?.fileArtifactReplay?.stats.artifactReplayEnabled ?? false,

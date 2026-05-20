@@ -11,7 +11,7 @@ import { createRequire } from 'module';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { SupportedLanguages } from 'gitnexus-shared';
+import { getLanguageFromFilename, type SupportedLanguages } from 'gitnexus-shared';
 import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.js';
 
 const ARTIFACT_SCHEMA_VERSION = 1;
@@ -80,6 +80,18 @@ export interface LoadFileParseArtifactInput {
   language?: SupportedLanguages | string;
   parserKey?: string;
 }
+
+export type FileParseArtifactLoadMissReason =
+  | 'missing-index-entry'
+  | 'missing-shard'
+  | 'invalid-artifact'
+  | 'language-mismatch'
+  | 'parser-key-mismatch'
+  | 'corrupt-index';
+
+export type LoadFileParseArtifactResult =
+  | { status: 'hit'; artifact: FileParseArtifact; recoveredLanguageMetadata: boolean }
+  | { status: 'miss'; reason: FileParseArtifactLoadMissReason };
 
 interface FileArtifactCacheIndexEntry {
   filePath: string;
@@ -294,7 +306,7 @@ export const splitParseWorkerResultsByFile = (
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([filePath, payload]) => ({
       filePath,
-      language: payload.nodes[0]?.properties.language,
+      language: payload.nodes[0]?.properties.language ?? getLanguageFromFilename(filePath),
       payload: {
         ...payload,
         fileCount: 1,
@@ -337,6 +349,32 @@ const loadIndex = async (storagePath: string): Promise<FileArtifactCacheIndex> =
   }
 };
 
+const loadIndexWithReason = async (
+  storagePath: string,
+): Promise<{ index: FileArtifactCacheIndex } | { reason: 'corrupt-index' }> => {
+  try {
+    const raw = await fs.readFile(getIndexPath(storagePath), 'utf-8');
+    const parsed = JSON.parse(raw) as FileArtifactCacheIndex;
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      parsed.version !== FILE_ARTIFACT_CACHE_VERSION ||
+      !Array.isArray(parsed.artifacts)
+    ) {
+      return { reason: 'corrupt-index' };
+    }
+    return {
+      index: {
+        version: FILE_ARTIFACT_CACHE_VERSION,
+        artifacts: parsed.artifacts.filter(isIndexEntry),
+      },
+    };
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return { index: emptyIndex() };
+    return { reason: 'corrupt-index' };
+  }
+};
+
 const saveIndex = async (storagePath: string, index: FileArtifactCacheIndex): Promise<void> => {
   const cacheDir = getFileArtifactCacheDir(storagePath);
   await fs.mkdir(cacheDir, { recursive: true });
@@ -347,29 +385,65 @@ export const loadFileParseArtifact = async (
   storagePath: string,
   input: LoadFileParseArtifactInput,
 ): Promise<FileParseArtifact | null> => {
-  const index = await loadIndex(storagePath);
-  const entry = index.artifacts.find(
-    (artifact) =>
-      artifact.filePath === input.filePath &&
-      artifact.contentHash === input.contentHash &&
-      (input.language === undefined || artifact.language === input.language) &&
-      (input.parserKey === undefined || artifact.parserKey === input.parserKey),
-  );
-  if (!entry) return null;
+  const result = await loadFileParseArtifactWithReason(storagePath, input);
+  return result.status === 'hit' ? result.artifact : null;
+};
 
-  const absShardPath = shardPath(storagePath, entry.shard);
-  if (!absShardPath) return null;
-  try {
-    const raw = await fs.readFile(absShardPath, 'utf-8');
-    const parsed = JSON.parse(raw, mapReviver) as FileParseArtifact;
-    if (!isFileParseArtifact(parsed)) return null;
-    if (parsed.filePath !== input.filePath || parsed.contentHash !== input.contentHash) return null;
-    if (input.language !== undefined && parsed.language !== input.language) return null;
-    if (input.parserKey !== undefined && parsed.parserKey !== input.parserKey) return null;
-    return parsed;
-  } catch {
-    return null;
+export const loadFileParseArtifactWithReason = async (
+  storagePath: string,
+  input: LoadFileParseArtifactInput,
+): Promise<LoadFileParseArtifactResult> => {
+  const loadedIndex = await loadIndexWithReason(storagePath);
+  if ('reason' in loadedIndex) return { status: 'miss', reason: loadedIndex.reason };
+
+  const candidates = loadedIndex.index.artifacts.filter(
+    (artifact) => artifact.filePath === input.filePath && artifact.contentHash === input.contentHash,
+  );
+  if (candidates.length === 0) return { status: 'miss', reason: 'missing-index-entry' };
+
+  const languageCompatible = candidates.filter(
+    (artifact) => input.language === undefined || artifact.language === undefined || artifact.language === input.language,
+  );
+  if (languageCompatible.length === 0) return { status: 'miss', reason: 'language-mismatch' };
+
+  const parserCompatible = languageCompatible.filter(
+    (artifact) => input.parserKey === undefined || artifact.parserKey === input.parserKey,
+  );
+  if (parserCompatible.length === 0) return { status: 'miss', reason: 'parser-key-mismatch' };
+
+  for (const entry of parserCompatible) {
+    const absShardPath = shardPath(storagePath, entry.shard);
+    if (!absShardPath) continue;
+    let parsed: FileParseArtifact;
+    try {
+      const raw = await fs.readFile(absShardPath, 'utf-8');
+      parsed = JSON.parse(raw, mapReviver) as FileParseArtifact;
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') return { status: 'miss', reason: 'missing-shard' };
+      return { status: 'miss', reason: 'invalid-artifact' };
+    }
+    if (!isFileParseArtifact(parsed)) return { status: 'miss', reason: 'invalid-artifact' };
+    if (parsed.filePath !== input.filePath || parsed.contentHash !== input.contentHash) {
+      return { status: 'miss', reason: 'invalid-artifact' };
+    }
+    if (
+      input.language !== undefined &&
+      parsed.language !== undefined &&
+      parsed.language !== input.language
+    ) {
+      return { status: 'miss', reason: 'language-mismatch' };
+    }
+    if (input.parserKey !== undefined && parsed.parserKey !== input.parserKey) {
+      return { status: 'miss', reason: 'parser-key-mismatch' };
+    }
+    return {
+      status: 'hit',
+      artifact: parsed,
+      recoveredLanguageMetadata: input.language !== undefined && parsed.language === undefined,
+    };
   }
+
+  return { status: 'miss', reason: 'missing-shard' };
 };
 
 export const saveFileParseArtifact = async (

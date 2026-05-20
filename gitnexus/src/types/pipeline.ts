@@ -27,6 +27,10 @@ export interface PipelineResult {
     parsedFiles: number;
     fileArtifactHits: number;
     fileArtifactMisses: number;
+    artifactMissFiles?: string[];
+    artifactMissReasons?: Record<string, number>;
+    freshParseReasons?: Record<string, number>;
+    artifactLanguageMetadataRecovered?: number;
     replayedFiles: number;
     freshParsedFiles: number;
     artifactReplayEnabled: boolean;

@@ -9,6 +9,7 @@ import {
   clearFileArtifactCache,
   getFileArtifactCacheDir,
   loadFileParseArtifact,
+  loadFileParseArtifactWithReason,
   pruneFileArtifactCache,
   saveFileParseArtifact,
   saveFileParseArtifactsBatch,
@@ -165,6 +166,19 @@ describe('file artifact cache', () => {
     expect(b?.relationships).toHaveLength(0);
   });
 
+  it('infers split artifact language from file path when nodes are absent', () => {
+    const batch = minimalResult({
+      imports: [{ filePath: 'astro.config.js', rawImportPath: 'astro/config', language: 'javascript' }],
+      parsedFiles: [{ filePath: 'astro.config.js', scopes: [] }] as ParseWorkerResult['parsedFiles'],
+    });
+
+    const split = splitParseWorkerResultsByFile([batch]);
+
+    expect(split).toHaveLength(1);
+    expect(split[0]?.filePath).toBe('astro.config.js');
+    expect(split[0]?.language).toBe('javascript');
+  });
+
   it('saves and loads a per-file artifact', async () => {
     await withTempStorage(async (storagePath) => {
       await saveFileParseArtifact(storagePath, {
@@ -219,6 +233,47 @@ describe('file artifact cache', () => {
     });
   });
 
+  it('loads legacy language-less artifacts when file path and content hash match', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        payload: minimalResult({ parsedFiles: [{ filePath: 'src/a.ts', scopes: [] }] as any }),
+      });
+
+      const loaded = await loadFileParseArtifactWithReason(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        language: 'typescript',
+      });
+
+      expect(loaded.status).toBe('hit');
+      if (loaded.status === 'hit') {
+        expect(loaded.recoveredLanguageMetadata).toBe(true);
+        expect(loaded.artifact.language).toBeUndefined();
+      }
+    });
+  });
+
+  it('rejects artifacts with an explicit wrong language', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        language: 'javascript',
+        payload: minimalResult(),
+      });
+
+      await expect(
+        loadFileParseArtifactWithReason(storagePath, {
+          filePath: 'src/a.ts',
+          contentHash: 'hash-a',
+          language: 'typescript',
+        }),
+      ).resolves.toEqual({ status: 'miss', reason: 'language-mismatch' });
+    });
+  });
+
   it('returns a miss for artifact version mismatch', async () => {
     await withTempStorage(async (storagePath) => {
       await saveFileParseArtifact(storagePath, {
@@ -262,6 +317,27 @@ describe('file artifact cache', () => {
       await expect(
         loadFileParseArtifact(storagePath, { filePath: 'src/a.ts', contentHash: 'hash-a' }),
       ).resolves.toBeNull();
+    });
+  });
+
+  it('reports a missing shard as a per-file miss', async () => {
+    await withTempStorage(async (storagePath) => {
+      await saveFileParseArtifact(storagePath, {
+        filePath: 'src/a.ts',
+        contentHash: 'hash-a',
+        language: 'typescript',
+        payload: minimalResult(),
+      });
+      const [shard] = await shardPaths(storagePath);
+      await fs.rm(shard);
+
+      await expect(
+        loadFileParseArtifactWithReason(storagePath, {
+          filePath: 'src/a.ts',
+          contentHash: 'hash-a',
+          language: 'typescript',
+        }),
+      ).resolves.toEqual({ status: 'miss', reason: 'missing-shard' });
     });
   });
 

@@ -229,6 +229,8 @@ interface AnalyzeProfileCounters {
   artifactLanguageMetadataRecovered?: number;
   artifactMissFiles?: string[];
   replayedFiles: number;
+  workerEligibleFiles?: number;
+  workerEligibleBytes?: number;
   freshParsedFiles?: number;
   artifactReplayEnabled: boolean;
   artifactReplayMode?: 'disabled' | 'full' | 'partial';
@@ -278,7 +280,7 @@ export const formatAnalyzeProfileLog = (
   counters: AnalyzeProfileCounters,
 ): string[] => [
   'Analyze profile:',
-  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, freshParsedFiles=${counters.freshParsedFiles ?? counters.parsedFiles}, artifactReplay=${counters.artifactReplayEnabled ? (counters.artifactReplayMode ?? 'enabled') : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}, artifactLanguageMetadataRecovered=${counters.artifactLanguageMetadataRecovered ?? 0}`,
+  `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, freshParsedFiles=${counters.freshParsedFiles ?? counters.parsedFiles}, workerEligibleFiles=${counters.workerEligibleFiles ?? counters.parsedFiles}, workerEligibleBytes=${counters.workerEligibleBytes ?? 0}, artifactReplay=${counters.artifactReplayEnabled ? (counters.artifactReplayMode ?? 'enabled') : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}, artifactLanguageMetadataRecovered=${counters.artifactLanguageMetadataRecovered ?? 0}`,
   `  artifactReplayDetails: freshReasons=${formatCounterRecord(counters.freshParseReasons)}, missReasons=${formatCounterRecord(counters.artifactMissReasons)}, missSamples=${counters.artifactMissFiles?.slice(0, 10).join(',') || 'none'}`,
   `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}, scopeFinalizeCacheHit=${counters.scopeFinalizeCacheHits ?? 0}, scopeFinalizeCacheMiss=${counters.scopeFinalizeCacheMisses ?? 0}, scopeFinalizeCacheDisabledReason=${counters.scopeFinalizeCacheDisabledReason ?? 'none'}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
@@ -1227,6 +1229,8 @@ export async function runFullAnalysis(
             fileArtifactHits: 0,
             fileArtifactMisses: 0,
             replayedFiles: 0,
+            workerEligibleFiles: 0,
+            workerEligibleBytes: 0,
             freshParsedFiles: 0,
             artifactReplayEnabled: false,
             artifactReplayMode: 'disabled' as const,

@@ -163,6 +163,8 @@ export const runPipelineFromRepo = async (
     parseCacheMisses: number;
     parsedFilesCount: number;
     replayedFiles: number;
+    workerEligibleFiles: number;
+    workerEligibleBytes: number;
     fileParseArtifacts: readonly CapturedFileParseArtifact[];
   }>(results, 'parse');
   const { totalFiles, usedWorkerPool } = parseOutput;
@@ -215,6 +217,8 @@ export const runPipelineFromRepo = async (
       artifactLanguageMetadataRecovered:
         options?.fileArtifactReplay?.stats.artifactLanguageMetadataRecovered,
       replayedFiles: parseOutput.replayedFiles,
+      workerEligibleFiles: parseOutput.workerEligibleFiles,
+      workerEligibleBytes: parseOutput.workerEligibleBytes,
       freshParsedFiles: options?.fileArtifactReplay?.stats.freshParsedFiles ?? parseOutput.parsedFilesCount,
       artifactReplayEnabled: options?.fileArtifactReplay?.stats.artifactReplayEnabled ?? false,
       artifactReplayMode: options?.fileArtifactReplay?.stats.artifactReplayMode,

@@ -98,7 +98,7 @@ describe('run-analyze module', () => {
 
     expect(lines).toEqual([
       'Analyze profile:',
-      '  counters: parseCacheHits=13, parseCacheMisses=14, parsedFiles=15, fileArtifactHits=16, fileArtifactMisses=17, replayedFiles=0, freshParsedFiles=15, artifactReplay=disabled(not incremental), artifactLanguageMetadataRecovered=0',
+      '  counters: parseCacheHits=13, parseCacheMisses=14, parsedFiles=15, fileArtifactHits=16, fileArtifactMisses=17, replayedFiles=0, freshParsedFiles=15, workerEligibleFiles=15, workerEligibleBytes=0, artifactReplay=disabled(not incremental), artifactLanguageMetadataRecovered=0',
       '  artifactReplayDetails: freshReasons=none, missReasons=none, missSamples=none',
       '  scopeCounters: scopePreExtractedHits=18, scopePreExtractedMisses=19, scopeFilesExtracted=20, scopeFilesResolved=21, scopeFinalizeCacheHit=0, scopeFinalizeCacheMiss=0, scopeFinalizeCacheDisabledReason=none',
       '  pipeline: total=91ms, scan=1ms, structure=2ms, markdown=3ms, cobol=4ms, parseExtract=4ms, routes=5ms, tools=6ms, orm=7ms, crossFile=6ms, scopeResolution=8ms, mro=9ms, communities=7ms, processes=8ms',

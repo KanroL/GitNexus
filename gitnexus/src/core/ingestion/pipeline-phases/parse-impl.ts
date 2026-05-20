@@ -176,6 +176,8 @@ export async function runChunkedParseAndResolve(
   parseCacheMisses: number;
   parsedFilesCount: number;
   replayedFiles: number;
+  workerEligibleFiles: number;
+  workerEligibleBytes: number;
   fileParseArtifacts: CapturedFileParseArtifact[];
 }> {
   const ctx = createResolutionContext();
@@ -362,13 +364,14 @@ export async function runChunkedParseAndResolve(
   // to exercise the worker-pool path with small fixtures; see PipelineOptions.
   const MIN_FILES_FOR_WORKERS = options?.workerThresholdsForTest?.minFiles ?? 15;
   const MIN_BYTES_FOR_WORKERS = options?.workerThresholdsForTest?.minBytes ?? 512 * 1024;
-  const totalBytes = activeParseableScanned.reduce((s, f) => s + f.size, 0);
+  const workerEligibleFiles = activeParseableScanned.length;
+  const workerEligibleBytes = activeParseableScanned.reduce((s, f) => s + f.size, 0);
 
   // Create worker pool once, reuse across chunks
   let workerPool: WorkerPool | undefined;
   if (
     !options?.skipWorkers &&
-    (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS)
+    (workerEligibleFiles >= MIN_FILES_FOR_WORKERS || workerEligibleBytes >= MIN_BYTES_FOR_WORKERS)
   ) {
     try {
       let workerUrl = new URL('../workers/parse-worker.js', import.meta.url);
@@ -399,6 +402,10 @@ export async function runChunkedParseAndResolve(
         'Worker pool creation failed, using sequential fallback:',
       );
     }
+  } else if (isDev && totalParseable !== workerEligibleFiles) {
+    logger.info(
+      `🧵 parse worker pool skipped: ${workerEligibleFiles} fresh/reparsed file(s), ${totalParseable - workerEligibleFiles} replayed file(s)`,
+    );
   }
 
   let filesParsedSoFar = 0;
@@ -924,6 +931,8 @@ export async function runChunkedParseAndResolve(
     parseCacheMisses: chunkCacheMisses,
     parsedFilesCount: liveParsedFiles,
     replayedFiles: replayStats?.replayedFiles ?? 0,
+    workerEligibleFiles,
+    workerEligibleBytes,
     fileParseArtifacts: [...fileParseArtifacts.values()].sort((a, b) =>
       a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0,
     ),

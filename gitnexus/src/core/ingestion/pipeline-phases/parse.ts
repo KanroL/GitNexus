@@ -104,6 +104,10 @@ export interface ParseOutput {
   readonly parsedFilesCount: number;
   /** Number of files replayed from per-file parse artifacts. */
   readonly replayedFiles: number;
+  /** Number of active files considered for live worker parsing after replay. */
+  readonly workerEligibleFiles: number;
+  /** Total bytes considered for live worker parsing after replay. */
+  readonly workerEligibleBytes: number;
   /** Worker-equivalent per-file artifacts captured for persistence after successful analyze. */
   readonly fileParseArtifacts: readonly CapturedFileParseArtifact[];
 }

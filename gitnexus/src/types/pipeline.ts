@@ -32,6 +32,8 @@ export interface PipelineResult {
     freshParseReasons?: Record<string, number>;
     artifactLanguageMetadataRecovered?: number;
     replayedFiles: number;
+    workerEligibleFiles: number;
+    workerEligibleBytes: number;
     freshParsedFiles: number;
     artifactReplayEnabled: boolean;
     artifactReplayMode?: 'disabled' | 'full' | 'partial';

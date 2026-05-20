@@ -668,8 +668,12 @@ export function useValue(): string {
       const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
 
       expect(incremental.pipelineResult?.parseStats.artifactReplayEnabled).toBe(true);
+      expect(incremental.pipelineResult?.usedWorkerPool).toBe(false);
       expect(incremental.pipelineResult?.parseStats.fileArtifactHits).toBeGreaterThan(0);
       expect(incremental.pipelineResult?.parseStats.replayedFiles).toBeGreaterThan(0);
+      expect(incremental.pipelineResult?.parseStats.workerEligibleFiles).toBe(
+        incremental.pipelineResult?.parseStats.parsedFiles,
+      );
       expect(incremental.pipelineResult?.parseStats.parsedFiles).toBeLessThan(
         incremental.pipelineResult!.parseStats.replayedFiles,
       );

@@ -320,6 +320,63 @@ describe('incremental indexing integration', () => {
     }
   }, 600_000);
 
+  it('modified GitNexus-tracked file does not take unchanged fast path when git status is clean', async () => {
+    const repo = await setupRepo();
+    const previousNoGitignore = process.env.GITNEXUS_NO_GITIGNORE;
+    try {
+      process.env.GITNEXUS_NO_GITIGNORE = '1';
+      await writeFile(path.join(repo.dbPath, '.gitignore'), 'src/local.ts\n');
+      execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add .gitignore', {
+        cwd: repo.dbPath,
+        stdio: 'pipe',
+      });
+      execSync(
+        'git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m ignore-local',
+        {
+          cwd: repo.dbPath,
+          stdio: 'pipe',
+        },
+      );
+      await writeFile(path.join(repo.dbPath, 'src', 'local.ts'), 'export const local = 1;\n');
+      await runFullAnalysis(repo.dbPath, { ...analyzeOptions, force: true }, callbacks());
+
+      await writeFile(path.join(repo.dbPath, 'src', 'local.ts'), 'export const local = 2;\n');
+      const gitStatus = execSync(
+        "git status --porcelain -- . ':(exclude).gitnexus' ':(exclude).gitnexus/**' ':(exclude).claude' ':(exclude).claude/**' ':(exclude).cursor' ':(exclude).cursor/**' ':(exclude)AGENTS.md' ':(exclude)CLAUDE.md'",
+        { cwd: repo.dbPath, encoding: 'utf8' },
+      );
+      expect(gitStatus.trim()).toBe('');
+
+      const { storagePath, lbugPath, metaPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath,
+        lbugPath,
+        metaPath,
+        meta: meta!,
+      });
+      expect(report.isUpToDate).toBe(false);
+      expect(report.changes.modified).toBe(1);
+
+      const logs: string[] = [];
+      const events: string[] = [];
+      const result = await runFullAnalysis(repo.dbPath, analyzeOptions, {
+        onProgress: (phase) => events.push(phase),
+        onLog: (message) => logs.push(message),
+      });
+
+      expect(result.alreadyUpToDate).toBeUndefined();
+      expect(logs).not.toContain('Already up to date');
+      expect(events).toContain('extracting');
+    } finally {
+      if (previousNoGitignore === undefined) delete process.env.GITNEXUS_NO_GITIGNORE;
+      else process.env.GITNEXUS_NO_GITIGNORE = previousNoGitignore;
+      await repo.cleanup();
+    }
+  }, 600_000);
+
   it('status is up to date after incremental analyze updates source hashes', async () => {
     const repo = await setupRepo();
     try {

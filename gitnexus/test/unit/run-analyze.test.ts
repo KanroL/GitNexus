@@ -7,7 +7,13 @@ import {
   deriveEmbeddingCap,
   DEFAULT_EMBEDDING_NODE_LIMIT,
 } from '../../src/core/embedding-mode.js';
-import { getStoragePaths, saveMeta, type RepoMeta } from '../../src/storage/repo-manager.js';
+import {
+  getStoragePaths,
+  INCREMENTAL_SCHEMA_VERSION,
+  saveMeta,
+  type RepoMeta,
+} from '../../src/storage/repo-manager.js';
+import { computeFileHash } from '../../src/storage/file-hash.js';
 import { createTempDir } from '../helpers/test-db.js';
 
 describe('run-analyze module', () => {
@@ -105,8 +111,10 @@ describe('run-analyze module', () => {
   it('creates .gitnexus/.gitignore on the already-up-to-date fast path (#1233)', async () => {
     const tmpRepo = await createTempDir('gitnexus-run-analyze-fast-path-');
     try {
+      await fs.writeFile(path.join(tmpRepo.dbPath, 'index.ts'), 'export const value = 1;\n');
       execSync('git init', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
-      execSync('git -c user.name=test -c user.email=test@test commit --allow-empty -m init', {
+      execSync('git add index.ts', { cwd: tmpRepo.dbPath, stdio: 'pipe' });
+      execSync('git -c user.name=test -c user.email=test@test commit -m init', {
         cwd: tmpRepo.dbPath,
         stdio: 'pipe',
       });
@@ -115,10 +123,14 @@ describe('run-analyze module', () => {
         encoding: 'utf-8',
       }).trim();
       const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+      const indexHash = await computeFileHash(path.join(tmpRepo.dbPath, 'index.ts'));
+      expect(indexHash).not.toBeNull();
       const meta: RepoMeta = {
         repoPath: tmpRepo.dbPath,
         lastCommit: currentCommit,
         indexedAt: new Date().toISOString(),
+        schemaVersion: INCREMENTAL_SCHEMA_VERSION,
+        fileHashes: { 'index.ts': indexHash! },
       };
       await saveMeta(storagePath, meta);
 

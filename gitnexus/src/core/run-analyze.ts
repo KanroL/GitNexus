@@ -11,7 +11,6 @@
 
 import path from 'path';
 import fs from 'fs/promises';
-import { execFileSync } from 'child_process';
 import { runPipelineFromRepo } from './ingestion/pipeline.js';
 import {
   initLbug,
@@ -353,69 +352,6 @@ export async function runFullAnalysis(
     options = { ...options, force: true };
   }
 
-  // ── Early-return: already up to date ──────────────────────────────
-  if (existingMeta && !options.force && existingMeta.lastCommit === currentCommit) {
-    // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
-    if (currentCommit !== '') {
-      // For git repos, even if HEAD matches lastCommit, the working tree
-      // may have uncommitted changes. Only short-circuit when the working
-      // tree is also clean — otherwise fall through to the incremental
-      // path which will hash-diff and update only changed files.
-      //
-      // We exclude paths that GitNexus itself writes during analyze:
-      //   .gitnexus/                  — db / parse cache / meta.json
-      //   .claude/, .cursor/          — auto-generated agent skill files
-      //   AGENTS.md, CLAUDE.md        — auto-updated stats blocks
-      // Counting them as dirty would perpetually defeat the up-to-date
-      // fast path because the previous analyze just wrote them
-      // (regression vs PR #1233 behavior).
-      const dirty = (() => {
-        try {
-          const out = execFileSync(
-            'git',
-            [
-              'status',
-              '--porcelain',
-              '--',
-              '.',
-              ':(exclude).gitnexus',
-              ':(exclude).gitnexus/**',
-              ':(exclude).claude',
-              ':(exclude).claude/**',
-              ':(exclude).cursor',
-              ':(exclude).cursor/**',
-              ':(exclude)AGENTS.md',
-              ':(exclude)CLAUDE.md',
-            ],
-            {
-              cwd: repoPath,
-              stdio: ['ignore', 'pipe', 'ignore'],
-              encoding: 'utf8',
-            },
-          );
-          return out.trim().length > 0;
-        } catch {
-          return true; // conservative on git failure
-        }
-      })();
-      if (!dirty) {
-        await ensureGitNexusIgnored(repoPath);
-        return {
-          // `resolveRepoIdentityRoot` collapses worktree roots to the
-          // canonical repo basename (#1259) but leaves arbitrary subdirs
-          // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
-          repoName:
-            options.registryName ??
-            getInferredRepoName(repoPath) ??
-            path.basename(resolveRepoIdentityRoot(repoPath)),
-          repoPath,
-          stats: existingMeta.stats ?? {},
-          alreadyUpToDate: true,
-        };
-      }
-    }
-  }
-
   // ── Cache embeddings from existing index before rebuild ────────────
   // Four modes:
   //   --embeddings              -> load cache, restore, then generate any new ones
@@ -509,6 +445,7 @@ export async function runFullAnalysis(
     hashDiff.deleted.length === 0
   ) {
     log('Already up to date');
+    await ensureGitNexusIgnored(repoPath);
     if (isAnalyzeProfilingEnabled()) {
       const totalAnalyzeMs = Date.now() - analyzeStart;
       const accounted =

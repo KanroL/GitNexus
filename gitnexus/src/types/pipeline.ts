@@ -54,6 +54,9 @@ export interface PipelineResult {
     partialEnabled: boolean;
     partialDisabledReason?: string;
     partialAffectedFiles: number;
+    partialRawAffectedFiles: number;
+    partialMatchedAffectedFiles: number;
+    partialUnmatchedAffectedFiles: readonly string[];
     referenceSitesResolved: number;
     referenceSitesTotal: number;
     emitFiles: number;

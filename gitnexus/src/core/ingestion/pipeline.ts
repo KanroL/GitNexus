@@ -97,6 +97,9 @@ export interface PartialScopeResolutionStats {
   scopePartialEnabled: boolean;
   scopePartialDisabledReason?: string;
   scopePartialAffectedFiles: number;
+  scopePartialRawAffectedFiles: number;
+  scopePartialMatchedAffectedFiles: number;
+  scopePartialUnmatchedAffectedFiles?: string[];
   scopeReferenceSitesResolved: number;
   scopeReferenceSitesTotal: number;
   scopeEmitFiles: number;
@@ -259,6 +262,9 @@ export const runPipelineFromRepo = async (
       partialEnabled: scopeOutput.partialEnabled,
       partialDisabledReason: scopeOutput.partialDisabledReason,
       partialAffectedFiles: scopeOutput.partialAffectedFiles,
+      partialRawAffectedFiles: scopeOutput.partialRawAffectedFiles,
+      partialMatchedAffectedFiles: scopeOutput.partialMatchedAffectedFiles,
+      partialUnmatchedAffectedFiles: scopeOutput.partialUnmatchedAffectedFiles,
       referenceSitesResolved: scopeOutput.referenceSitesResolved,
       referenceSitesTotal: scopeOutput.referenceSitesTotal,
       emitFiles: scopeOutput.emitFiles,

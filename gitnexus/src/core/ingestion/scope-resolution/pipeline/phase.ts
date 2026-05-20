@@ -28,6 +28,7 @@
  */
 
 import type { PipelinePhase, PipelineContext, PhaseResult } from '../../pipeline-phases/types.js';
+import path from 'path';
 import { getPhaseOutput } from '../../pipeline-phases/types.js';
 import type { StructureOutput } from '../../pipeline-phases/structure.js';
 import type { ParseOutput } from '../../pipeline-phases/parse.js';
@@ -73,12 +74,31 @@ const hasUnsupportedPartialScopeHook = (provider: ScopeResolver): string | undef
   return undefined;
 };
 
+const normalizePartialScopePath = (filePath: string, repoPath?: string): string => {
+  let normalized = filePath.replace(/\\/g, '/');
+  if (repoPath !== undefined && path.isAbsolute(normalized)) {
+    normalized = path.relative(repoPath, normalized).replace(/\\/g, '/');
+  }
+  if (/^[A-Za-z]:\//.test(normalized) && repoPath !== undefined) {
+    normalized = path.win32.relative(repoPath.replace(/\\/g, '/'), normalized).replace(/\\/g, '/');
+  }
+  while (normalized.startsWith('./')) normalized = normalized.slice(2);
+  normalized = path.posix.normalize(normalized);
+  return normalized === '.' ? '' : normalized;
+};
+
+const addUnmatchedPartialScopeSample = (stats: PipelineOptions['partialScopeResolution']['stats'], filePath: string): void => {
+  stats.scopePartialUnmatchedAffectedFiles ??= [];
+  if (stats.scopePartialUnmatchedAffectedFiles.length < 10) stats.scopePartialUnmatchedAffectedFiles.push(filePath);
+};
+
 export const buildPartialScopeResolutionInput = (
   options: PipelineOptions | undefined,
   lang: SupportedLanguages,
   provider: ScopeResolver,
   files: readonly { path: string; content: string }[],
   finalizeCacheHit: boolean,
+  repoPath?: string,
 ): { sourceFiles: ReadonlySet<string>; disabledReason?: string } | undefined => {
   const partial = options?.partialScopeResolution;
   const setDisabled = (reason: string): { sourceFiles: ReadonlySet<string>; disabledReason: string } => {
@@ -96,14 +116,21 @@ export const buildPartialScopeResolutionInput = (
   if (options.fileArtifactReplay?.stats.artifactReplayEnabled !== true) {
     return setDisabled('artifact replay not enabled');
   }
-  const languageFiles = new Set(files.map((file) => file.path));
+  const languageFiles = new Map<string, string>();
+  for (const file of files) languageFiles.set(normalizePartialScopePath(file.path, repoPath), file.path);
+  const rawAffected = new Set([
+    ...partial.affectedFiles,
+    ...(options.fileArtifactReplay?.stats.artifactMissFiles ?? []),
+  ]);
   const affected = new Set<string>();
-  for (const filePath of partial.affectedFiles) {
-    if (languageFiles.has(filePath)) affected.add(filePath);
+  for (const filePath of rawAffected) {
+    const normalized = normalizePartialScopePath(filePath, repoPath);
+    const matched = languageFiles.get(normalized);
+    if (matched !== undefined) affected.add(matched);
+    else addUnmatchedPartialScopeSample(partial.stats, filePath);
   }
-  for (const filePath of options.fileArtifactReplay?.stats.artifactMissFiles ?? []) {
-    if (languageFiles.has(filePath)) affected.add(filePath);
-  }
+  partial.stats.scopePartialRawAffectedFiles += rawAffected.size;
+  partial.stats.scopePartialMatchedAffectedFiles += affected.size;
   if (affected.size === 0) return setDisabled('no affected files for language');
   partial.stats.scopePartialEnabled = true;
   partial.stats.scopePartialDisabledReason = undefined;
@@ -129,6 +156,9 @@ export interface ScopeResolutionOutput {
   readonly partialEnabled: boolean;
   readonly partialDisabledReason?: string;
   readonly partialAffectedFiles: number;
+  readonly partialRawAffectedFiles: number;
+  readonly partialMatchedAffectedFiles: number;
+  readonly partialUnmatchedAffectedFiles: readonly string[];
   readonly referenceSitesResolved: number;
   readonly referenceSitesTotal: number;
   readonly emitFiles: number;
@@ -164,6 +194,9 @@ const NOOP_OUTPUT: ScopeResolutionOutput = Object.freeze({
   partialEnabled: false,
   partialDisabledReason: 'scope resolution did not run',
   partialAffectedFiles: 0,
+  partialRawAffectedFiles: 0,
+  partialMatchedAffectedFiles: 0,
+  partialUnmatchedAffectedFiles: [],
   referenceSitesResolved: 0,
   referenceSitesTotal: 0,
   emitFiles: 0,
@@ -229,6 +262,9 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
     let partialEnabled = false;
     let partialDisabledReason: string | undefined;
     let partialAffectedFiles = 0;
+    let partialRawAffectedFiles = 0;
+    let partialMatchedAffectedFiles = 0;
+    let partialUnmatchedAffectedFiles: readonly string[] = [];
     let referenceSitesResolved = 0;
     let referenceSitesTotal = 0;
     let emitFiles = 0;
@@ -319,7 +355,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
             ? { preparedParsedFiles: currentParsedFiles }
             : {}),
           cachedFinalizeOutput,
-          partialResolution: buildPartialScopeResolutionInput(ctx.options, lang, provider, files, cachedFinalizeOutput !== undefined),
+          partialResolution: buildPartialScopeResolutionInput(ctx.options, lang, provider, files, cachedFinalizeOutput !== undefined, ctx.repoPath),
           onWarn: (msg) => {
             if (isSemanticModelValidatorEnabled()) {
               logger.warn(`[scope-resolution:${lang}] ${msg}`);
@@ -336,6 +372,9 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       if (stats.partialEnabled) partialEnabled = true;
       if (stats.partialDisabledReason !== undefined) partialDisabledReason = stats.partialDisabledReason;
       partialAffectedFiles += stats.partialAffectedFiles;
+      partialRawAffectedFiles = ctx.options?.partialScopeResolution?.stats.scopePartialRawAffectedFiles ?? partialRawAffectedFiles;
+      partialMatchedAffectedFiles = ctx.options?.partialScopeResolution?.stats.scopePartialMatchedAffectedFiles ?? partialMatchedAffectedFiles;
+      partialUnmatchedAffectedFiles = ctx.options?.partialScopeResolution?.stats.scopePartialUnmatchedAffectedFiles ?? partialUnmatchedAffectedFiles;
       referenceSitesResolved += stats.resolve.sitesProcessed;
       referenceSitesTotal += stats.referenceSitesTotal;
       emitFiles += stats.emitFiles;
@@ -383,6 +422,9 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
         ? undefined
         : (partialDisabledReason ?? ctx.options.partialScopeResolution.disabledReason ?? 'partial scope disabled');
       ctx.options.partialScopeResolution.stats.scopePartialAffectedFiles = partialAffectedFiles;
+      ctx.options.partialScopeResolution.stats.scopePartialRawAffectedFiles = partialRawAffectedFiles;
+      ctx.options.partialScopeResolution.stats.scopePartialMatchedAffectedFiles = partialMatchedAffectedFiles;
+      ctx.options.partialScopeResolution.stats.scopePartialUnmatchedAffectedFiles = [...partialUnmatchedAffectedFiles];
       ctx.options.partialScopeResolution.stats.scopeReferenceSitesResolved = referenceSitesResolved;
       ctx.options.partialScopeResolution.stats.scopeReferenceSitesTotal = referenceSitesTotal;
       ctx.options.partialScopeResolution.stats.scopeEmitFiles = emitFiles;
@@ -402,6 +444,9 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       partialEnabled,
       partialDisabledReason,
       partialAffectedFiles,
+      partialRawAffectedFiles,
+      partialMatchedAffectedFiles,
+      partialUnmatchedAffectedFiles,
       referenceSitesResolved,
       referenceSitesTotal,
       emitFiles,

@@ -19,6 +19,45 @@ import { buildPartialScopeResolutionInput } from '../../src/core/ingestion/scope
 import type { ScopeResolutionIndexes } from '../../src/core/ingestion/model/scope-resolution-indexes.js';
 
 const range = { startLine: 1, startCol: 0, endLine: 1, endCol: 10 };
+const repoPath = '/repo/project';
+
+const partialStats = () => ({
+  scopePartialEnabled: false,
+  scopePartialAffectedFiles: 0,
+  scopePartialRawAffectedFiles: 0,
+  scopePartialMatchedAffectedFiles: 0,
+  scopePartialUnmatchedAffectedFiles: [] as string[],
+  scopeReferenceSitesResolved: 0,
+  scopeReferenceSitesTotal: 0,
+  scopeEmitFiles: 0,
+});
+
+const partialOptions = (input: {
+  affectedFiles?: Iterable<string>;
+  artifactMissFiles?: string[];
+  stats?: ReturnType<typeof partialStats>;
+}): PipelineOptions => ({
+  fileArtifactReplay: {
+    storagePath: '/tmp/gitnexus-test',
+    currentFileHashes: new Map(),
+    freshFiles: new Set(),
+    stats: {
+      artifactReplayEnabled: true,
+      fileArtifactHits: 1,
+      fileArtifactMisses: input.artifactMissFiles?.length ?? 0,
+      artifactMissFiles: input.artifactMissFiles ?? [],
+      replayedFiles: 1,
+      freshParsedFiles: input.artifactMissFiles?.length ?? 0,
+    },
+  },
+  partialScopeResolution: {
+    enabled: true,
+    affectedFiles: new Set(input.affectedFiles ?? []),
+    stats: input.stats ?? partialStats(),
+  },
+});
+
+const tsProvider = { language: SupportedLanguages.TypeScript } as ScopeResolver;
 
 const moduleScope = (filePath: string): Scope => ({
   id: `scope:${filePath}#1:0-1:10:module`,
@@ -52,41 +91,17 @@ const indexesFor = (
 
 describe('partial scope resolution', () => {
   it('includes fresh artifact misses in the partial affected set', () => {
-    const stats = {
-      scopePartialEnabled: false,
-      scopePartialAffectedFiles: 0,
-      scopeReferenceSitesResolved: 0,
-      scopeReferenceSitesTotal: 0,
-      scopeEmitFiles: 0,
-    };
-    const options: PipelineOptions = {
-      fileArtifactReplay: {
-        storagePath: '/tmp/gitnexus-test',
-        currentFileHashes: new Map(),
-        freshFiles: new Set(),
-        stats: {
-          artifactReplayEnabled: true,
-          fileArtifactHits: 1,
-          fileArtifactMisses: 1,
-          artifactMissFiles: ['src/fresh.ts', 'src/ignored.py'],
-          replayedFiles: 1,
-          freshParsedFiles: 1,
-        },
-      },
-      partialScopeResolution: {
-        enabled: true,
-        affectedFiles: new Set(['src/changed.ts']),
-        stats,
-      },
-    };
-    const provider = {
-      language: SupportedLanguages.TypeScript,
-    } as ScopeResolver;
+    const stats = partialStats();
+    const options = partialOptions({
+      affectedFiles: ['src/changed.ts'],
+      artifactMissFiles: ['src/fresh.ts', 'src/ignored.py'],
+      stats,
+    });
 
     const partial = buildPartialScopeResolutionInput(
       options,
       SupportedLanguages.TypeScript,
-      provider,
+      tsProvider,
       [
         { path: 'src/changed.ts', content: '' },
         { path: 'src/fresh.ts', content: '' },
@@ -98,6 +113,73 @@ describe('partial scope resolution', () => {
     expect(partial?.sourceFiles).toEqual(new Set(['src/changed.ts', 'src/fresh.ts']));
     expect(stats.scopePartialEnabled).toBe(true);
     expect(stats.scopePartialAffectedFiles).toBe(2);
+    expect(stats.scopePartialRawAffectedFiles).toBe(3);
+    expect(stats.scopePartialMatchedAffectedFiles).toBe(2);
+    expect(stats.scopePartialUnmatchedAffectedFiles).toEqual(['src/ignored.py']);
+  });
+
+  it('matches affected repo-relative paths against parsed file paths', () => {
+    const stats = partialStats();
+    const partial = buildPartialScopeResolutionInput(
+      partialOptions({ affectedFiles: ['./src/changed.ts'], stats }),
+      SupportedLanguages.TypeScript,
+      tsProvider,
+      [{ path: 'src/changed.ts', content: '' }],
+      true,
+      repoPath,
+    );
+
+    expect(partial?.sourceFiles).toEqual(new Set(['src/changed.ts']));
+    expect(stats.scopePartialMatchedAffectedFiles).toBe(1);
+  });
+
+  it('matches absolute affected paths against parsed file paths', () => {
+    const stats = partialStats();
+    const partial = buildPartialScopeResolutionInput(
+      partialOptions({ affectedFiles: [`${repoPath}/src/changed.ts`], stats }),
+      SupportedLanguages.TypeScript,
+      tsProvider,
+      [{ path: 'src/changed.ts', content: '' }],
+      true,
+      repoPath,
+    );
+
+    expect(partial?.sourceFiles).toEqual(new Set(['src/changed.ts']));
+    expect(stats.scopePartialMatchedAffectedFiles).toBe(1);
+  });
+
+  it('matches artifact-miss paths for provider language files', () => {
+    const stats = partialStats();
+    const partial = buildPartialScopeResolutionInput(
+      partialOptions({ artifactMissFiles: [`${repoPath}/src/fresh.ts`], stats }),
+      SupportedLanguages.TypeScript,
+      tsProvider,
+      [{ path: 'src/fresh.ts', content: '' }],
+      true,
+      repoPath,
+    );
+
+    expect(partial?.sourceFiles).toEqual(new Set(['src/fresh.ts']));
+    expect(stats.scopePartialMatchedAffectedFiles).toBe(1);
+  });
+
+  it('falls back when no affected files match provider language files', () => {
+    const stats = partialStats();
+    const partial = buildPartialScopeResolutionInput(
+      partialOptions({ affectedFiles: ['src/changed.py'], stats }),
+      SupportedLanguages.TypeScript,
+      tsProvider,
+      [{ path: 'src/changed.ts', content: '' }],
+      true,
+      repoPath,
+    );
+
+    expect(partial?.disabledReason).toBe('no affected files for language');
+    expect(partial?.sourceFiles).toEqual(new Set());
+    expect(stats.scopePartialEnabled).toBe(false);
+    expect(stats.scopePartialRawAffectedFiles).toBe(1);
+    expect(stats.scopePartialMatchedAffectedFiles).toBe(0);
+    expect(stats.scopePartialUnmatchedAffectedFiles).toEqual(['src/changed.py']);
   });
 
   it('resolves only selected source files while keeping global targets visible', () => {

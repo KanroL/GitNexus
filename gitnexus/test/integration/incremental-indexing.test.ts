@@ -377,6 +377,79 @@ describe('incremental indexing integration', () => {
     }
   }, 600_000);
 
+  it('body-only incremental edit reuses cached scope finalize output', async () => {
+    const repo = await setupRepo();
+    const workerOptions = {
+      ...analyzeOptions,
+      workerThresholdsForTest: { minFiles: 1, minBytes: 1 },
+    };
+    try {
+      await runFullAnalysis(repo.dbPath, { ...workerOptions, force: true }, callbacks());
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'consumer.ts'),
+        `import { value } from './provider';
+
+export function useValue(): string {
+  const next = value();
+  return next;
+}
+`,
+      );
+      const warm = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
+      expect(warm.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'consumer.ts'),
+        `import { value } from './provider';
+
+export function useValue(): string {
+  const next = value();
+  return next.toUpperCase();
+}
+`,
+      );
+      const cached = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
+      expect(cached.alreadyUpToDate).toBeUndefined();
+      expect(cached.pipelineResult?.scopeStats.finalizeCacheHits).toBeGreaterThan(0);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('import/export rename misses cached scope finalize output', async () => {
+    const repo = await setupRepo();
+    const workerOptions = {
+      ...analyzeOptions,
+      workerThresholdsForTest: { minFiles: 1, minBytes: 1 },
+    };
+    try {
+      await runFullAnalysis(repo.dbPath, { ...workerOptions, force: true }, callbacks());
+      await writeFile(path.join(repo.dbPath, 'src', 'extra.ts'), 'export function extra(): number { return 2; }\n');
+      const warm = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
+      expect(warm.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'provider.ts'),
+        "export function renamedValue(): string { return 'v2'; }\n",
+      );
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'consumer.ts'),
+        `import { renamedValue } from './provider';
+
+export function useValue(): string {
+  return renamedValue();
+}
+`,
+      );
+      const renamed = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
+      expect(renamed.pipelineResult?.scopeStats.finalizeCacheHits ?? 0).toBe(0);
+      expect(renamed.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+
   it('status is up to date after incremental analyze updates source hashes', async () => {
     const repo = await setupRepo();
     try {

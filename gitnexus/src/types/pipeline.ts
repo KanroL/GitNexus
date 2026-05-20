@@ -36,6 +36,9 @@ export interface PipelineResult {
     preExtractedMisses: number;
     filesExtracted: number;
     filesResolved: number;
+    finalizeCacheHits: number;
+    finalizeCacheMisses: number;
+    finalizeCacheDisabledReason?: string;
     extractMs: number;
     finalizeMs: number;
     propagateMs: number;

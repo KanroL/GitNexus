@@ -1,0 +1,244 @@
+import { createHash } from 'crypto';
+import fs from 'fs/promises';
+import path from 'path';
+import type {
+  BindingRef,
+  FinalizedScc,
+  FinalizeStats,
+  ImportEdge,
+  ParsedFile,
+  ScopeId,
+  SupportedLanguages,
+} from 'gitnexus-shared';
+
+const SCOPE_FINALIZE_CACHE_SCHEMA_VERSION = 1;
+export const SCOPE_FINALIZE_CACHE_VERSION = String(SCOPE_FINALIZE_CACHE_SCHEMA_VERSION);
+
+const CACHE_DIRNAME = 'scope-finalize-cache';
+
+type SerializedImports = Array<[ScopeId, readonly ImportEdge[]]>;
+type SerializedBindings = Array<[ScopeId, Array<[string, readonly BindingRef[]]>]>;
+
+export interface ScopeFinalizeCacheEntry {
+  version: string;
+  language: SupportedLanguages | string;
+  providerId: string;
+  resolutionConfigHash: string;
+  filePaths: string[];
+  surfaceHashes: Record<string, string>;
+  imports: SerializedImports;
+  bindings: SerializedBindings;
+  sccs: readonly FinalizedScc[];
+  stats: FinalizeStats;
+}
+
+export interface ScopeFinalizeCachedOutput {
+  imports: ReadonlyMap<ScopeId, readonly ImportEdge[]>;
+  bindings: ReadonlyMap<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>;
+  sccs: readonly FinalizedScc[];
+  stats: FinalizeStats;
+}
+
+export interface ScopeFinalizeCacheMetadata {
+  language: SupportedLanguages | string;
+  providerId: string;
+  resolutionConfigHash: string;
+  filePaths: string[];
+  surfaceHashes: Record<string, string>;
+}
+
+export interface ScopeFinalizeCacheHit {
+  hit: true;
+  output: ScopeFinalizeCachedOutput;
+}
+
+export interface ScopeFinalizeCacheMiss {
+  hit: false;
+  reason: string;
+}
+
+export type ScopeFinalizeCacheLoadResult = ScopeFinalizeCacheHit | ScopeFinalizeCacheMiss;
+
+const MAP_TAG = '__$mapEntries$__';
+const SET_TAG = '__$setValues$__';
+
+const jsonReplacer = (_key: string, value: unknown): unknown => {
+  if (value instanceof Map) return { [MAP_TAG]: Array.from(value.entries()) };
+  if (value instanceof Set) return { [SET_TAG]: Array.from(value.values()) };
+  return value;
+};
+
+const jsonReviver = (_key: string, value: unknown): unknown => {
+  if (value && typeof value === 'object') {
+    const v = value as Record<string, unknown>;
+    if (Array.isArray(v[MAP_TAG])) return new Map(v[MAP_TAG] as [unknown, unknown][]);
+    if (Array.isArray(v[SET_TAG])) return new Set(v[SET_TAG] as unknown[]);
+  }
+  return value;
+};
+
+const stableJson = (value: unknown): string =>
+  JSON.stringify(normalizeForStableJson(value), jsonReplacer);
+
+const normalizeForStableJson = (value: unknown): unknown => {
+  if (value instanceof Map) {
+    return new Map(
+      Array.from(value.entries())
+        .map(([k, v]) => [k, normalizeForStableJson(v)] as const)
+        .sort(([a], [b]) => String(a).localeCompare(String(b))),
+    );
+  }
+  if (value instanceof Set) {
+    return new Set(Array.from(value.values()).map(normalizeForStableJson).sort());
+  }
+  if (Array.isArray(value)) return value.map(normalizeForStableJson);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = normalizeForStableJson((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+};
+
+const sha256Hex = (input: string): string => createHash('sha256').update(input).digest('hex');
+
+const cacheFilePath = (storagePath: string, language: SupportedLanguages | string): string =>
+  path.join(storagePath, CACHE_DIRNAME, `${String(language).replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
+
+export const computeScopeFinalizeSurfaceHash = (parsed: ParsedFile): string =>
+  sha256Hex(
+    stableJson({
+      filePath: parsed.filePath,
+      moduleScope: parsed.moduleScope,
+      parsedImports: parsed.parsedImports,
+      localDefs: parsed.localDefs,
+    }),
+  );
+
+export const computeResolutionConfigHash = (resolutionConfig: unknown): string =>
+  sha256Hex(stableJson(resolutionConfig ?? null));
+
+const serializeImports = (
+  imports: ReadonlyMap<ScopeId, readonly ImportEdge[]>,
+): SerializedImports => Array.from(imports.entries()).sort(([a], [b]) => a.localeCompare(b));
+
+const serializeBindings = (
+  bindings: ReadonlyMap<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>,
+): SerializedBindings =>
+  Array.from(bindings.entries())
+    .map(([scopeId, byName]) => [
+      scopeId,
+      Array.from(byName.entries()).sort(([a], [b]) => a.localeCompare(b)),
+    ] as [ScopeId, Array<[string, readonly BindingRef[]]>])
+    .sort(([a], [b]) => a.localeCompare(b));
+
+const deserializeImports = (
+  imports: SerializedImports,
+): ReadonlyMap<ScopeId, readonly ImportEdge[]> => new Map(imports);
+
+const deserializeBindings = (
+  bindings: SerializedBindings,
+): ReadonlyMap<ScopeId, ReadonlyMap<string, readonly BindingRef[]>> => {
+  const out = new Map<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>();
+  for (const [scopeId, entries] of bindings) out.set(scopeId, new Map(entries));
+  return out;
+};
+
+const isCacheEntry = (value: unknown): value is ScopeFinalizeCacheEntry => {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v.version === SCOPE_FINALIZE_CACHE_VERSION &&
+    typeof v.language === 'string' &&
+    typeof v.providerId === 'string' &&
+    typeof v.resolutionConfigHash === 'string' &&
+    Array.isArray(v.filePaths) &&
+    typeof v.surfaceHashes === 'object' &&
+    v.surfaceHashes !== null &&
+    Array.isArray(v.imports) &&
+    Array.isArray(v.bindings) &&
+    Array.isArray(v.sccs) &&
+    typeof v.stats === 'object' &&
+    v.stats !== null
+  );
+};
+
+export const buildScopeFinalizeCacheMetadata = (
+  language: SupportedLanguages | string,
+  providerId: string,
+  resolutionConfigHash: string,
+  parsedFiles: readonly ParsedFile[],
+): ScopeFinalizeCacheMetadata => {
+  const filePaths = parsedFiles.map((f) => f.filePath).sort();
+  const surfaceHashes: Record<string, string> = {};
+  for (const parsed of parsedFiles) {
+    surfaceHashes[parsed.filePath] = computeScopeFinalizeSurfaceHash(parsed);
+  }
+  return { language, providerId, resolutionConfigHash, filePaths, surfaceHashes };
+};
+
+export const loadScopeFinalizeCache = async (
+  storagePath: string,
+  metadata: ScopeFinalizeCacheMetadata,
+): Promise<ScopeFinalizeCacheLoadResult> => {
+  let entry: ScopeFinalizeCacheEntry;
+  try {
+    entry = JSON.parse(
+      await fs.readFile(cacheFilePath(storagePath, metadata.language), 'utf-8'),
+      jsonReviver,
+    ) as ScopeFinalizeCacheEntry;
+  } catch {
+    return { hit: false, reason: 'missing cache' };
+  }
+  if (!isCacheEntry(entry)) return { hit: false, reason: 'invalid cache' };
+  if (entry.language !== metadata.language) return { hit: false, reason: 'language mismatch' };
+  if (entry.providerId !== metadata.providerId) return { hit: false, reason: 'provider mismatch' };
+  if (entry.resolutionConfigHash !== metadata.resolutionConfigHash) {
+    return { hit: false, reason: 'resolution config changed' };
+  }
+  if (entry.filePaths.length !== metadata.filePaths.length) {
+    return { hit: false, reason: 'file set changed' };
+  }
+  for (let i = 0; i < metadata.filePaths.length; i++) {
+    if (entry.filePaths[i] !== metadata.filePaths[i]) return { hit: false, reason: 'file set changed' };
+  }
+  for (const filePath of metadata.filePaths) {
+    if (entry.surfaceHashes[filePath] !== metadata.surfaceHashes[filePath]) {
+      return { hit: false, reason: 'finalize surface changed' };
+    }
+  }
+  return {
+    hit: true,
+    output: {
+      imports: deserializeImports(entry.imports),
+      bindings: deserializeBindings(entry.bindings),
+      sccs: entry.sccs,
+      stats: entry.stats,
+    },
+  };
+};
+
+export const saveScopeFinalizeCache = async (
+  storagePath: string,
+  metadata: ScopeFinalizeCacheMetadata,
+  output: ScopeFinalizeCachedOutput,
+): Promise<void> => {
+  const cachePath = cacheFilePath(storagePath, metadata.language);
+  await fs.mkdir(path.dirname(cachePath), { recursive: true });
+  const entry: ScopeFinalizeCacheEntry = {
+    version: SCOPE_FINALIZE_CACHE_VERSION,
+    language: metadata.language,
+    providerId: metadata.providerId,
+    resolutionConfigHash: metadata.resolutionConfigHash,
+    filePaths: metadata.filePaths,
+    surfaceHashes: metadata.surfaceHashes,
+    imports: serializeImports(output.imports),
+    bindings: serializeBindings(output.bindings),
+    sccs: output.sccs,
+    stats: output.stats,
+  };
+  await fs.writeFile(`${cachePath}.tmp`, JSON.stringify(entry, jsonReplacer), 'utf-8');
+  await fs.rename(`${cachePath}.tmp`, cachePath);
+};

@@ -99,7 +99,7 @@ describe('run-analyze module', () => {
     expect(lines).toEqual([
       'Analyze profile:',
       '  counters: parseCacheHits=13, parseCacheMisses=14, parsedFiles=15, fileArtifactHits=16, fileArtifactMisses=17, replayedFiles=0, artifactReplay=disabled(not incremental)',
-      '  scopeCounters: scopePreExtractedHits=18, scopePreExtractedMisses=19, scopeFilesExtracted=20, scopeFilesResolved=21',
+      '  scopeCounters: scopePreExtractedHits=18, scopePreExtractedMisses=19, scopeFilesExtracted=20, scopeFilesResolved=21, scopeFinalizeCacheHit=0, scopeFinalizeCacheMiss=0, scopeFinalizeCacheDisabledReason=none',
       '  pipeline: total=91ms, scan=1ms, structure=2ms, markdown=3ms, cobol=4ms, parseExtract=4ms, routes=5ms, tools=6ms, orm=7ms, crossFile=6ms, scopeResolution=8ms, mro=9ms, communities=7ms, processes=8ms',
       '  scopeResolution: extract=30ms, finalize=31ms, propagate=32ms, resolve=33ms, emit=34ms',
       '  db: writeback=9ms, init=10ms, close=26ms, dirtyMeta=11ms, fullWipe=12ms, writeSetPlanning=13ms, deleteRows=14ms, deleteGraphWide=15ms, subgraphExtract=16ms, graphLoad=17ms, validation=10ms, checkpointReopen=11ms',

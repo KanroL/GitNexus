@@ -36,6 +36,9 @@ import type {
   BindingRef,
   FinalizeFile,
   FinalizeHooks,
+  FinalizedScc,
+  FinalizeStats,
+  ImportEdge,
   ParsedFile,
   Scope,
   ScopeId,
@@ -51,6 +54,13 @@ import {
   finalize,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+
+export interface SharedFinalizeOutput {
+  readonly imports: ReadonlyMap<ScopeId, readonly ImportEdge[]>;
+  readonly bindings: ReadonlyMap<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>;
+  readonly sccs: readonly FinalizedScc[];
+  readonly stats: FinalizeStats;
+}
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
@@ -97,6 +107,14 @@ export function finalizeScopeModel(
     workspaceIndex,
   };
   const finalizeOut = finalize(finalizeInput, hooks);
+
+  return buildScopeResolutionIndexes(parsedFiles, finalizeOut);
+}
+
+export function buildScopeResolutionIndexes(
+  parsedFiles: readonly ParsedFile[],
+  finalizeOut: SharedFinalizeOutput,
+): ScopeResolutionIndexes {
 
   // ── Step 2: Workspace-wide indexes built from the per-file unions.
   // These are pure aggregations — no algorithm beyond what the builders

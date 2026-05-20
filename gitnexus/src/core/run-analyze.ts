@@ -231,6 +231,9 @@ interface AnalyzeProfileCounters {
   scopePreExtractedMisses?: number;
   scopeFilesExtracted?: number;
   scopeFilesResolved?: number;
+  scopeFinalizeCacheHits?: number;
+  scopeFinalizeCacheMisses?: number;
+  scopeFinalizeCacheDisabledReason?: string;
 }
 
 export const isAnalyzeProfilingEnabled = (): boolean => process.env.GITNEXUS_VERBOSE === '1';
@@ -262,7 +265,7 @@ export const formatAnalyzeProfileLog = (
 ): string[] => [
   'Analyze profile:',
   `  counters: parseCacheHits=${counters.parseCacheHits}, parseCacheMisses=${counters.parseCacheMisses}, parsedFiles=${counters.parsedFiles}, fileArtifactHits=${counters.fileArtifactHits}, fileArtifactMisses=${counters.fileArtifactMisses}, replayedFiles=${counters.replayedFiles}, artifactReplay=${counters.artifactReplayEnabled ? 'enabled' : `disabled(${counters.artifactReplayDisabledReason ?? 'not attempted'})`}`,
-  `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}`,
+  `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}, scopeFinalizeCacheHit=${counters.scopeFinalizeCacheHits ?? 0}, scopeFinalizeCacheMiss=${counters.scopeFinalizeCacheMisses ?? 0}, scopeFinalizeCacheDisabledReason=${counters.scopeFinalizeCacheDisabledReason ?? 'none'}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
   `  scopeResolution: extract=${formatMs(timings.scopeExtractMs)}, finalize=${formatMs(timings.scopeFinalizeMs)}, propagate=${formatMs(timings.scopePropagateMs)}, resolve=${formatMs(timings.scopeResolveMs)}, emit=${formatMs(timings.scopeEmitMs)}`,
   `  db: writeback=${formatMs(timings.dbWritebackMs)}, init=${formatMs(timings.lbugInitMs)}, close=${formatMs(timings.finalCloseMs)}, dirtyMeta=${formatMs(timings.dirtyMetaMs)}, fullWipe=${formatMs(timings.fullWipeMs)}, writeSetPlanning=${formatMs(timings.writeSetPlanningMs)}, deleteRows=${formatMs(timings.deleteRowsMs)}, deleteGraphWide=${formatMs(timings.deleteGraphWideMs)}, subgraphExtract=${formatMs(timings.subgraphExtractMs)}, graphLoad=${formatMs(timings.graphLoadMs)}, validation=${formatMs(timings.validationMs)}, checkpointReopen=${formatMs(timings.checkpointReopenMs)}`,
@@ -598,6 +601,7 @@ export async function runFullAnalysis(
             },
           }
         : {}),
+      ...(isIncremental ? { scopeFinalizeCache: { storagePath } } : {}),
     },
   );
   profile.pipelineMs = Date.now() - pipelineStart;
@@ -1207,6 +1211,10 @@ export async function runFullAnalysis(
           scopePreExtractedMisses: pipelineResult.scopeStats?.preExtractedMisses ?? 0,
           scopeFilesExtracted: pipelineResult.scopeStats?.filesExtracted ?? 0,
           scopeFilesResolved: pipelineResult.scopeStats?.filesResolved ?? 0,
+          scopeFinalizeCacheHits: pipelineResult.scopeStats?.finalizeCacheHits ?? 0,
+          scopeFinalizeCacheMisses: pipelineResult.scopeStats?.finalizeCacheMisses ?? 0,
+          scopeFinalizeCacheDisabledReason:
+            pipelineResult.scopeStats?.finalizeCacheDisabledReason,
         },
       );
       for (const line of profileLines) log(line);

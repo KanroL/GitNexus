@@ -37,6 +37,13 @@ import { readFileContents } from '../../filesystem-walker.js';
 import { runScopeResolution } from './run.js';
 import { SCOPE_RESOLVERS } from './registry.js';
 import { isDev, isSemanticModelValidatorEnabled } from '../../utils/env.js';
+import {
+  buildScopeFinalizeCacheMetadata,
+  computeResolutionConfigHash,
+  loadScopeFinalizeCache,
+  saveScopeFinalizeCache,
+  type ScopeFinalizeCachedOutput,
+} from '../../../../storage/scope-finalize-cache.js';
 
 import { logger } from '../../../logger.js';
 
@@ -65,6 +72,9 @@ export interface ScopeResolutionOutput {
   readonly preExtractedHits: number;
   readonly preExtractedMisses: number;
   readonly filesExtracted: number;
+  readonly finalizeCacheHits: number;
+  readonly finalizeCacheMisses: number;
+  readonly finalizeCacheDisabledReason?: string;
   readonly timings: {
     readonly extractMs: number;
     readonly finalizeMs: number;
@@ -91,6 +101,9 @@ const NOOP_OUTPUT: ScopeResolutionOutput = Object.freeze({
   preExtractedHits: 0,
   preExtractedMisses: 0,
   filesExtracted: 0,
+  finalizeCacheHits: 0,
+  finalizeCacheMisses: 0,
+  finalizeCacheDisabledReason: 'scope resolution did not run',
   timings: { extractMs: 0, finalizeMs: 0, propagateMs: 0, resolveMs: 0, emitMs: 0 },
   perLanguage: new Map(),
 });
@@ -147,6 +160,9 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
     let totalPreExtractedHits = 0;
     let totalPreExtractedMisses = 0;
     let totalFilesExtracted = 0;
+    let totalFinalizeCacheHits = 0;
+    let totalFinalizeCacheMisses = 0;
+    let finalizeCacheDisabledReason: string | undefined;
     const totalTimings = { extractMs: 0, finalizeMs: 0, propagateMs: 0, resolveMs: 0, emitMs: 0 };
     let anyRan = false;
     const perLanguage = new Map<
@@ -181,6 +197,47 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
           ? await provider.loadResolutionConfig(ctx.repoPath)
           : undefined;
 
+      const resolutionConfigHash = computeResolutionConfigHash(resolutionConfig);
+      let cachedFinalizeOutput: ScopeFinalizeCachedOutput | undefined;
+      let cacheMetadata: ReturnType<typeof buildScopeFinalizeCacheMetadata> | undefined;
+      const cacheStoragePath = ctx.options?.scopeFinalizeCache?.storagePath;
+      if (cacheStoragePath === undefined) {
+        finalizeCacheDisabledReason = 'scope finalize cache not enabled';
+      }
+
+      // Compute cache metadata only after extraction/replay inside runScopeResolution would
+      // normally occur. To keep runScopeResolution synchronous, mirror the same validated
+      // pre-extracted artifacts here for the cache decision by file path.
+      const currentParsedFiles: import('gitnexus-shared').ParsedFile[] = [];
+      if (cacheStoragePath !== undefined) {
+        for (const file of files) {
+          const parsed = preExtractedByPath.get(file.path);
+          if (parsed === undefined) {
+            finalizeCacheDisabledReason = 'missing pre-extracted parsed file';
+            break;
+          }
+          currentParsedFiles.push(parsed);
+        }
+        if (currentParsedFiles.length === files.length) {
+          for (const parsed of currentParsedFiles) provider.populateOwners(parsed);
+          provider.populateWorkspaceOwners?.(currentParsedFiles, { fileContents: contents });
+          cacheMetadata = buildScopeFinalizeCacheMetadata(
+            lang,
+            `${lang}:${provider.language}`,
+            resolutionConfigHash,
+            currentParsedFiles,
+          );
+          const cached = await loadScopeFinalizeCache(cacheStoragePath, cacheMetadata);
+          if (cached.hit === true) {
+            cachedFinalizeOutput = cached.output;
+            totalFinalizeCacheHits++;
+          } else {
+            totalFinalizeCacheMisses++;
+            finalizeCacheDisabledReason = cached.reason;
+          }
+        }
+      }
+
       const stats = runScopeResolution(
         {
           graph: ctx.graph,
@@ -189,6 +246,10 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
           treeCache: scopeTreeCache,
           resolutionConfig,
           preExtractedParsedFiles: preExtractedByPath,
+          ...(currentParsedFiles.length === files.length
+            ? { preparedParsedFiles: currentParsedFiles }
+            : {}),
+          cachedFinalizeOutput,
           onWarn: (msg) => {
             if (isSemanticModelValidatorEnabled()) {
               logger.warn(`[scope-resolution:${lang}] ${msg}`);
@@ -205,6 +266,13 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       totalPreExtractedHits += stats.preExtractedHits;
       totalPreExtractedMisses += stats.preExtractedMisses;
       totalFilesExtracted += stats.filesExtracted;
+      if (cacheStoragePath !== undefined && cacheMetadata !== undefined && !stats.finalizeCacheHit) {
+        try {
+          await saveScopeFinalizeCache(cacheStoragePath, cacheMetadata, stats.finalizeOutput);
+        } catch (err) {
+          finalizeCacheDisabledReason = `cache save failed: ${(err as Error).message}`;
+        }
+      }
       totalTimings.extractMs += stats.timings.extractMs;
       totalTimings.finalizeMs += stats.timings.finalizeMs;
       totalTimings.propagateMs += stats.timings.propagateMs;
@@ -241,6 +309,9 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
       preExtractedHits: totalPreExtractedHits,
       preExtractedMisses: totalPreExtractedMisses,
       filesExtracted: totalFilesExtracted,
+      finalizeCacheHits: totalFinalizeCacheHits,
+      finalizeCacheMisses: totalFinalizeCacheMisses,
+      finalizeCacheDisabledReason,
       timings: totalTimings,
       perLanguage,
     };

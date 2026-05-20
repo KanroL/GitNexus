@@ -81,6 +81,10 @@ export interface PipelineOptions {
     freshFiles: ReadonlySet<string>;
     stats: FileArtifactReplayStats;
   };
+  /** Optional per-language shared-finalize cache used only by scopeResolution. */
+  scopeFinalizeCache?: {
+    storagePath: string;
+  };
 }
 
 export interface FileArtifactReplayStats {
@@ -210,6 +214,9 @@ export const runPipelineFromRepo = async (
       preExtractedMisses: scopeOutput.preExtractedMisses,
       filesExtracted: scopeOutput.filesExtracted,
       filesResolved: scopeOutput.filesProcessed,
+      finalizeCacheHits: scopeOutput.finalizeCacheHits,
+      finalizeCacheMisses: scopeOutput.finalizeCacheMisses,
+      finalizeCacheDisabledReason: scopeOutput.finalizeCacheDisabledReason,
       extractMs: scopeOutput.timings.extractMs,
       finalizeMs: scopeOutput.timings.finalizeMs,
       propagateMs: scopeOutput.timings.propagateMs,

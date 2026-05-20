@@ -29,7 +29,11 @@ import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-m
 import { reconcileOwnership, validateOwnershipParity } from './reconcile-ownership.js';
 import { validateBindingsImmutability } from './validate-bindings-immutability.js';
 import { extractParsedFile } from '../../scope-extractor-bridge.js';
-import { finalizeScopeModel } from '../../finalize-orchestrator.js';
+import {
+  buildScopeResolutionIndexes,
+  finalizeScopeModel,
+  type SharedFinalizeOutput,
+} from '../../finalize-orchestrator.js';
 import { resolveReferenceSites, type ResolveStats } from '../../resolve-references.js';
 import { buildGraphNodeLookup } from '../graph-bridge/node-lookup.js';
 import { resolveDefGraphId } from '../graph-bridge/ids.js';
@@ -160,6 +164,9 @@ interface RunScopeResolutionInput {
    * Cache miss is safe — falls back to fresh extract.
    */
   readonly preExtractedParsedFiles?: ReadonlyMap<string, ParsedFile>;
+  /** Parsed files already extracted and owner-populated by the caller. */
+  readonly preparedParsedFiles?: readonly ParsedFile[];
+  readonly cachedFinalizeOutput?: SharedFinalizeOutput;
 }
 
 interface RunScopeResolutionStats {
@@ -179,6 +186,10 @@ interface RunScopeResolutionStats {
     readonly resolveMs: number;
     readonly emitMs: number;
   };
+  readonly finalizeCacheHit: boolean;
+  readonly finalizeCacheMiss: boolean;
+  readonly finalizeCacheDisabledReason?: string;
+  readonly finalizeOutput: SharedFinalizeOutput;
 }
 
 const elapsedMs = (start: bigint, end: bigint): number => Number(end - start) / 1_000_000;
@@ -208,38 +219,43 @@ export function runScopeResolution(
   let preExtractedHits = 0;
   let preExtractedMisses = 0;
   let filesExtracted = 0;
-  for (const file of files) {
-    let parsed: ParsedFile | undefined;
-    // Fast path: a worker (during the parse phase) already produced a
-    // ParsedFile for this file via `extractParsedFile`. Reuse it
-    // directly — skips a tree-sitter re-parse on the main thread.
-    if (preExtracted !== undefined) {
-      parsed = preExtracted.get(file.path);
-      if (parsed !== undefined) preExtractedHits++;
-    }
-    if (parsed === undefined) {
-      preExtractedMisses++;
-      const cachedTree = treeCache?.get(file.path);
-      parsed = extractParsedFile(
-        provider.languageProvider,
-        file.content,
-        file.path,
-        onWarn,
-        cachedTree,
-      );
-      if (parsed === undefined) {
-        filesSkipped++;
-        continue;
+  if (input.preparedParsedFiles !== undefined) {
+    parsedFiles.push(...input.preparedParsedFiles);
+    preExtractedHits += input.preparedParsedFiles.length;
+  } else {
+    for (const file of files) {
+      let parsed: ParsedFile | undefined;
+      // Fast path: a worker (during the parse phase) already produced a
+      // ParsedFile for this file via `extractParsedFile`. Reuse it
+      // directly — skips a tree-sitter re-parse on the main thread.
+      if (preExtracted !== undefined) {
+        parsed = preExtracted.get(file.path);
+        if (parsed !== undefined) preExtractedHits++;
       }
-      filesExtracted++;
+      if (parsed === undefined) {
+        preExtractedMisses++;
+        const cachedTree = treeCache?.get(file.path);
+        parsed = extractParsedFile(
+          provider.languageProvider,
+          file.content,
+          file.path,
+          onWarn,
+          cachedTree,
+        );
+        if (parsed === undefined) {
+          filesSkipped++;
+          continue;
+        }
+        filesExtracted++;
+      }
+      provider.populateOwners(parsed);
+      parsedFiles.push(parsed);
     }
-    provider.populateOwners(parsed);
-    parsedFiles.push(parsed);
+    provider.populateWorkspaceOwners?.(parsedFiles, { fileContents: getFileContents() });
   }
   if (PROF && preExtracted !== undefined) {
     logger.warn(`[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`);
   }
-  provider.populateWorkspaceOwners?.(parsedFiles, { fileContents: getFileContents() });
 
   // Reconcile scope-resolution's ownership view into the SemanticModel.
   // See `reconcile-ownership.ts` for the full rationale (Contract
@@ -274,6 +290,22 @@ export function runScopeResolution(
         resolveMs: 0,
         emitMs: 0,
       },
+      finalizeCacheHit: false,
+      finalizeCacheMiss: false,
+      finalizeCacheDisabledReason: 'no parsed files',
+      finalizeOutput: {
+        imports: new Map(),
+        bindings: new Map(),
+        sccs: [],
+        stats: {
+          totalFiles: 0,
+          totalEdges: 0,
+          linkedEdges: 0,
+          unresolvedEdges: 0,
+          sccCount: 0,
+          largestSccSize: 0,
+        },
+      },
     };
   }
 
@@ -282,16 +314,25 @@ export function runScopeResolution(
   const nodeLookup = buildGraphNodeLookup(graph);
 
   const resolutionConfig = input.resolutionConfig;
-  const finalized = finalizeScopeModel(parsedFiles, {
-    hooks: {
-      resolveImportTarget: (targetRaw, fromFile) =>
-        provider.resolveImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
-      expandsWildcardTo: (targetModuleScope) =>
-        provider.expandsWildcardTo?.(targetModuleScope, parsedFiles) ?? [],
-      mergeBindings: (existing, incoming, scopeId) =>
-        provider.mergeBindings(existing, incoming, scopeId),
-    },
-  });
+  const cachedFinalizeOutput = input.cachedFinalizeOutput;
+  const finalized = cachedFinalizeOutput
+    ? buildScopeResolutionIndexes(parsedFiles, cachedFinalizeOutput)
+    : finalizeScopeModel(parsedFiles, {
+        hooks: {
+          resolveImportTarget: (targetRaw, fromFile) =>
+            provider.resolveImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
+          expandsWildcardTo: (targetModuleScope) =>
+            provider.expandsWildcardTo?.(targetModuleScope, parsedFiles) ?? [],
+          mergeBindings: (existing, incoming, scopeId) =>
+            provider.mergeBindings(existing, incoming, scopeId),
+        },
+      });
+  const finalizeOutput: SharedFinalizeOutput = {
+    imports: finalized.imports,
+    bindings: finalized.bindings,
+    sccs: finalized.sccs,
+    stats: finalized.stats,
+  };
   const preEmittedInheritanceSites = preEmitInheritanceEdges(graph, finalized, nodeLookup);
   const mroByClassDefId = provider.buildMro(graph, parsedFiles, nodeLookup);
   const extendsOnlyMroByClassDefId = provider.buildExtendsOnlyMro?.(graph, parsedFiles, nodeLookup);
@@ -456,5 +497,8 @@ export function runScopeResolution(
     referenceEdgesEmitted: emitted + receiverExtras + unresolvedReceiverExtras + freeCallExtras,
     referenceSkipped: skipped,
     timings,
+    finalizeCacheHit: cachedFinalizeOutput !== undefined,
+    finalizeCacheMiss: cachedFinalizeOutput === undefined,
+    finalizeOutput,
   };
 }

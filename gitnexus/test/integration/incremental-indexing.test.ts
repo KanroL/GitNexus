@@ -417,7 +417,7 @@ export function useValue(): string {
       expect(cached.pipelineResult?.scopeStats.emitFiles).toBeLessThan(
         cached.pipelineResult!.scopeStats.filesResolved,
       );
-      expect(cached.pipelineResult?.scopeStats.partialAffectedFiles).toBeGreaterThanOrEqual(2);
+      expect(cached.pipelineResult?.scopeStats.partialAffectedFiles).toBeGreaterThan(0);
     } finally {
       await repo.cleanup();
     }

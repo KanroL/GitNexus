@@ -34,6 +34,7 @@ import type { StructureOutput } from '../../pipeline-phases/structure.js';
 import type { ParseOutput } from '../../pipeline-phases/parse.js';
 import { isRegistryPrimary } from '../../registry-primary-flag.js';
 import { SupportedLanguages, getLanguageFromFilename } from 'gitnexus-shared';
+import type { BindingRef, ImportEdge, ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
 import { readFileContents } from '../../filesystem-walker.js';
 import { extractParsedFile } from '../../scope-extractor-bridge.js';
 import { runScopeResolution } from './run.js';
@@ -45,6 +46,7 @@ import {
   buildScopeFinalizeCacheMetadata,
   computeResolutionConfigHash,
   loadScopeFinalizeCache,
+  semanticDefKey,
   saveScopeFinalizeCache,
   type ScopeFinalizeCachedOutput,
 } from '../../../../storage/scope-finalize-cache.js';
@@ -93,6 +95,48 @@ const normalizePartialScopePath = (filePath: string, repoPath?: string): string 
 const addUnmatchedPartialScopeSample = (stats: PipelineOptions['partialScopeResolution']['stats'], filePath: string): void => {
   stats.scopePartialUnmatchedAffectedFiles ??= [];
   if (stats.scopePartialUnmatchedAffectedFiles.length < 10) stats.scopePartialUnmatchedAffectedFiles.push(filePath);
+};
+
+const patchCachedFinalizeOutput = (
+  cached: ScopeFinalizeCachedOutput,
+  currentParsedFiles: readonly ParsedFile[],
+): ScopeFinalizeCachedOutput => {
+  const currentDefsBySemanticKey = new Map<string, SymbolDefinition>();
+  for (const parsed of currentParsedFiles) {
+    for (const def of parsed.localDefs) currentDefsBySemanticKey.set(semanticDefKey(def), def);
+  }
+  const defByOldNodeId = new Map<string, SymbolDefinition>();
+  for (const byName of cached.bindings.values()) {
+    for (const refs of byName.values()) {
+      for (const ref of refs) {
+        const current = currentDefsBySemanticKey.get(semanticDefKey(ref.def));
+        if (current !== undefined) defByOldNodeId.set(ref.def.nodeId, current);
+      }
+    }
+  }
+
+  const patchEdge = (edge: ImportEdge): ImportEdge => {
+    if (edge.targetDefId === undefined) return edge;
+    const current = defByOldNodeId.get(edge.targetDefId);
+    return current === undefined ? edge : { ...edge, targetDefId: current.nodeId };
+  };
+  const patchRef = (ref: BindingRef): BindingRef => {
+    const current = defByOldNodeId.get(ref.def.nodeId);
+    if (current === undefined) {
+      return ref.via === undefined ? ref : { ...ref, via: patchEdge(ref.via) };
+    }
+    return { ...ref, def: current, ...(ref.via !== undefined ? { via: patchEdge(ref.via) } : {}) };
+  };
+
+  const imports = new Map<ScopeId, readonly ImportEdge[]>();
+  for (const [scopeId, edges] of cached.imports) imports.set(scopeId, edges.map(patchEdge));
+  const bindings = new Map<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>();
+  for (const [scopeId, byName] of cached.bindings) {
+    const patchedByName = new Map<string, readonly BindingRef[]>();
+    for (const [name, refs] of byName) patchedByName.set(name, refs.map(patchRef));
+    bindings.set(scopeId, patchedByName);
+  }
+  return { ...cached, imports, bindings };
 };
 
 export const buildPartialScopeResolutionInput = (
@@ -388,7 +432,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
           );
           const cached = await loadScopeFinalizeCache(cacheStoragePath, cacheMetadata);
           if (cached.hit === true) {
-            cachedFinalizeOutput = cached.output;
+            cachedFinalizeOutput = patchCachedFinalizeOutput(cached.output, currentParsedFiles);
             totalFinalizeCacheHits++;
             if (missingPreExtractedFiles.length > 0) {
               finalizePatchEnabled = true;

@@ -35,7 +35,11 @@ import {
   INCREMENTAL_SCHEMA_VERSION,
 } from '../storage/repo-manager.js';
 import { computeFileHashes } from '../storage/file-hash.js';
+import { computeScopeFinalizeSurfaceHash, loadScopeFinalizeSurfaceHashes } from '../storage/scope-finalize-cache.js';
 import { walkRepositoryPaths } from './ingestion/filesystem-walker.js';
+import { extractParsedFile } from './ingestion/scope-extractor-bridge.js';
+import { typescriptProvider, javascriptProvider } from './ingestion/languages/typescript.js';
+import { SupportedLanguages, getLanguageFromFilename } from 'gitnexus-shared';
 import { extractChangedSubgraph } from './incremental/subgraph-extract.js';
 import { deriveIncrementalPlan } from './incremental/plan.js';
 import { deriveIncrementalWriteSet } from './incremental/write-set.js';
@@ -256,6 +260,10 @@ interface AnalyzeProfileCounters {
   scopeFinalizeReusedFiles?: number;
   scopeFinalizePatchEnabled?: boolean;
   scopeFinalizePatchDisabledReason?: string;
+  semanticSurfaceChangedFiles?: number;
+  semanticSurfaceUnchangedFiles?: number;
+  importerExpansionSkipped?: number;
+  finalizeInvalidationReason?: string;
   scopeReferenceSitesResolved?: number;
   scopeReferenceSitesTotal?: number;
   scopeEmitFiles?: number;
@@ -271,6 +279,52 @@ const formatCounterRecord = (record: Record<string, number> | undefined): string
     .filter(([, count]) => count > 0)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(',') : 'none';
+};
+
+const computeChangedSemanticSurface = async (
+  repoPath: string,
+  storagePath: string,
+  changedFiles: readonly string[],
+): Promise<{
+  unchangedFiles: Set<string>;
+  changedCount: number;
+  unchangedCount: number;
+  invalidationReason?: string;
+}> => {
+  const previousHashes = await loadScopeFinalizeSurfaceHashes(storagePath, SupportedLanguages.TypeScript);
+  if (previousHashes === null) {
+    return { unchangedFiles: new Set(), changedCount: 0, unchangedCount: 0, invalidationReason: 'missing semantic surface cache' };
+  }
+  const unchangedFiles = new Set<string>();
+  let changedCount = 0;
+  let unchangedCount = 0;
+  for (const filePath of changedFiles) {
+    const language = getLanguageFromFilename(filePath);
+    const provider = language === SupportedLanguages.TypeScript ? typescriptProvider : language === SupportedLanguages.JavaScript ? javascriptProvider : undefined;
+    if (provider === undefined) {
+      changedCount++;
+      continue;
+    }
+    const source = await fs.readFile(path.join(repoPath, filePath), 'utf-8');
+    const parsed = extractParsedFile(provider, source, filePath);
+    if (parsed === undefined) {
+      changedCount++;
+      continue;
+    }
+    const currentHash = computeScopeFinalizeSurfaceHash(parsed);
+    if (previousHashes[filePath] === currentHash) {
+      unchangedFiles.add(filePath);
+      unchangedCount++;
+    } else {
+      changedCount++;
+    }
+  }
+  return {
+    unchangedFiles,
+    changedCount,
+    unchangedCount,
+    invalidationReason: changedCount > 0 ? 'semantic surface changed' : undefined,
+  };
 };
 
 const sumProfileMajorTimings = (timings: AnalyzeProfileTimings): number =>
@@ -301,6 +355,7 @@ export const formatAnalyzeProfileLog = (
   `  artifactReplayDetails: freshReasons=${formatCounterRecord(counters.freshParseReasons)}, missReasons=${formatCounterRecord(counters.artifactMissReasons)}, missSamples=${counters.artifactMissFiles?.slice(0, 10).join(',') || 'none'}, artifactLoad=${formatMs(counters.artifactLoadMs ?? 0)}, artifactIndexLoad=${formatMs(counters.artifactIndexLoadMs ?? 0)}, artifactShardLoad=${formatMs(counters.artifactShardLoadMs ?? 0)}, artifactShardReads=${counters.artifactShardReads ?? 0}`,
   `  scopeCounters: scopePreExtractedHits=${counters.scopePreExtractedHits ?? 0}, scopePreExtractedMisses=${counters.scopePreExtractedMisses ?? 0}, scopeFilesExtracted=${counters.scopeFilesExtracted ?? 0}, scopeFilesResolved=${counters.scopeFilesResolved ?? 0}, scopeFinalizeCacheHit=${counters.scopeFinalizeCacheHits ?? 0}, scopeFinalizeCacheMiss=${counters.scopeFinalizeCacheMisses ?? 0}, scopeFinalizeCacheDisabledReason=${counters.scopeFinalizeCacheDisabledReason ?? 'none'}`,
   `  scopeFinalizePatch: enabled=${counters.scopeFinalizePatchEnabled === true}, patchedFiles=${counters.scopeFinalizePatchedFiles ?? 0}, reusedFiles=${counters.scopeFinalizeReusedFiles ?? 0}, disabledReason=${counters.scopeFinalizePatchDisabledReason ?? 'none'}`,
+  `  semanticSurface: changedFiles=${counters.semanticSurfaceChangedFiles ?? 0}, unchangedFiles=${counters.semanticSurfaceUnchangedFiles ?? 0}, importerExpansionSkipped=${counters.importerExpansionSkipped ?? 0}, finalizeInvalidationReason=${counters.finalizeInvalidationReason ?? 'none'}`,
   `  scopePartial: enabled=${counters.scopePartialEnabled === true}, disabledReason=${counters.scopePartialDisabledReason ?? 'none'}, affectedFiles=${counters.scopePartialAffectedFiles ?? 0}, rawAffectedFiles=${counters.scopePartialRawAffectedFiles ?? 0}, matchedAffectedFiles=${counters.scopePartialMatchedAffectedFiles ?? 0}, unmatchedSamples=${counters.scopePartialUnmatchedAffectedFiles?.slice(0, 10).join(',') || 'none'}, referenceSitesResolved=${counters.scopeReferenceSitesResolved ?? 0}, referenceSitesTotal=${counters.scopeReferenceSitesTotal ?? 0}, emitFiles=${counters.scopeEmitFiles ?? 0}`,
   `  pipeline: total=${formatMs(timings.pipelineMs)}, scan=${formatMs(timings.scanMs)}, structure=${formatMs(timings.structureMs)}, markdown=${formatMs(timings.markdownMs)}, cobol=${formatMs(timings.cobolMs)}, parseExtract=${formatMs(timings.parseExtractMs)}, routes=${formatMs(timings.routesMs)}, tools=${formatMs(timings.toolsMs)}, orm=${formatMs(timings.ormMs)}, crossFile=${formatMs(timings.crossFileMs)}, scopeResolution=${formatMs(timings.scopeResolutionMs)}, mro=${formatMs(timings.mroMs)}, communities=${formatMs(timings.communitiesMs)}, processes=${formatMs(timings.processesMs)}`,
   `  scopeResolution: extract=${formatMs(timings.scopeExtractMs)}, finalize=${formatMs(timings.scopeFinalizeMs)}, propagate=${formatMs(timings.scopePropagateMs)}, resolve=${formatMs(timings.scopeResolveMs)}, emit=${formatMs(timings.scopeEmitMs)}`,
@@ -587,10 +642,20 @@ export async function runFullAnalysis(
 
   let incrementalFreshFiles: Set<string> | undefined;
   let incrementalShadowCandidates: string[] = [];
+  let semanticSurfaceChangedFiles = 0;
+  let semanticSurfaceUnchangedFiles = 0;
+  let importerExpansionSkipped = 0;
+  let finalizeInvalidationReason: string | undefined;
   if (isIncremental && hashDiff) {
     const importerExpansionStart = Date.now();
     incrementalFreshFiles = new Set(hashDiff.toWrite);
     const priorFileSet = new Set(existingMeta?.fileHashes ? Object.keys(existingMeta.fileHashes) : []);
+    const semanticSurface = hashDiff.added.length === 0 && hashDiff.deleted.length === 0
+      ? await computeChangedSemanticSurface(repoPath, storagePath, hashDiff.changed)
+      : { unchangedFiles: new Set<string>(), changedCount: hashDiff.changed.length, unchangedCount: 0, invalidationReason: 'file set changed' };
+    semanticSurfaceChangedFiles = semanticSurface.changedCount;
+    semanticSurfaceUnchangedFiles = semanticSurface.unchangedCount;
+    finalizeInvalidationReason = semanticSurface.invalidationReason;
     const shadowCandidates: string[] = [];
     for (const added of hashDiff.added) {
       for (const candidate of shadowCandidatesFor(added)) {
@@ -607,7 +672,9 @@ export async function runFullAnalysis(
       await initLbug(lbugPath);
       profile.lbugInitMs += Date.now() - initStart;
       const seenFrontier = new Set<string>();
-      let frontier = [...hashDiff.toWrite, ...hashDiff.deleted, ...shadowCandidates];
+      const importerSeeds = hashDiff.toWrite.filter((filePath) => !semanticSurface.unchangedFiles.has(filePath));
+      importerExpansionSkipped = hashDiff.toWrite.length - importerSeeds.length;
+      let frontier = [...importerSeeds, ...hashDiff.deleted, ...shadowCandidates];
       for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
         const nextFrontier: string[] = [];
         for (const f of frontier) {
@@ -1320,6 +1387,10 @@ export async function runFullAnalysis(
           scopeFinalizeReusedFiles: pipelineResult.scopeStats?.finalizeReusedFiles ?? 0,
           scopeFinalizePatchEnabled: pipelineResult.scopeStats?.finalizePatchEnabled ?? false,
           scopeFinalizePatchDisabledReason: pipelineResult.scopeStats?.finalizePatchDisabledReason,
+          semanticSurfaceChangedFiles,
+          semanticSurfaceUnchangedFiles,
+          importerExpansionSkipped,
+          finalizeInvalidationReason,
           scopeReferenceSitesResolved: pipelineResult.scopeStats?.referenceSitesResolved ?? 0,
           scopeReferenceSitesTotal: pipelineResult.scopeStats?.referenceSitesTotal ?? 0,
           scopeEmitFiles: pipelineResult.scopeStats?.emitFiles ?? 0,

@@ -11,7 +11,7 @@ import type {
   SupportedLanguages,
 } from 'gitnexus-shared';
 
-const SCOPE_FINALIZE_CACHE_SCHEMA_VERSION = 1;
+const SCOPE_FINALIZE_CACHE_SCHEMA_VERSION = 2;
 export const SCOPE_FINALIZE_CACHE_VERSION = String(SCOPE_FINALIZE_CACHE_SCHEMA_VERSION);
 
 const CACHE_DIRNAME = 'scope-finalize-cache';
@@ -113,9 +113,50 @@ export const computeScopeFinalizeSurfaceHash = (parsed: ParsedFile): string =>
       filePath: parsed.filePath,
       moduleScope: parsed.moduleScope,
       parsedImports: parsed.parsedImports,
-      localDefs: parsed.localDefs,
+      moduleSurfaceDefs: collectSemanticModuleSurfaceDefs(parsed),
     }),
   );
+
+export const semanticDefKey = (def: BindingRef['def']): string =>
+  stableJson({
+    filePath: def.filePath,
+    type: def.type,
+    qualifiedName: def.qualifiedName,
+    parameterCount: def.parameterCount,
+    requiredParameterCount: def.requiredParameterCount,
+    parameterTypes: def.parameterTypes,
+    returnType: def.returnType,
+    declaredType: def.declaredType,
+    templateArguments: def.templateArguments,
+  });
+
+const collectSemanticModuleSurfaceDefs = (parsed: ParsedFile): unknown[] => {
+  const moduleScope = parsed.scopes.find((scope) => scope.id === parsed.moduleScope);
+  const defs = new Map<string, BindingRef['def']>();
+  if (moduleScope !== undefined) {
+    const bindingValues = moduleScope.bindings instanceof Map
+      ? moduleScope.bindings.values()
+      : Object.values(moduleScope.bindings as unknown as Record<string, readonly BindingRef[]>);
+    for (const refs of bindingValues) {
+      for (const ref of refs) defs.set(semanticDefKey(ref.def), ref.def);
+    }
+  }
+  if (defs.size === 0) {
+    for (const def of parsed.localDefs) defs.set(semanticDefKey(def), def);
+  }
+  return Array.from(defs.values())
+    .map((def) => ({
+      type: def.type,
+      qualifiedName: def.qualifiedName,
+      parameterCount: def.parameterCount,
+      requiredParameterCount: def.requiredParameterCount,
+      parameterTypes: def.parameterTypes,
+      returnType: def.returnType,
+      declaredType: def.declaredType,
+      templateArguments: def.templateArguments,
+    }))
+    .sort((a, b) => stableJson(a).localeCompare(stableJson(b)));
+};
 
 export const computeResolutionConfigHash = (resolutionConfig: unknown): string =>
   sha256Hex(stableJson(resolutionConfig ?? null));
@@ -218,6 +259,23 @@ export const loadScopeFinalizeCache = async (
       stats: entry.stats,
     },
   };
+};
+
+export const loadScopeFinalizeSurfaceHashes = async (
+  storagePath: string,
+  language: SupportedLanguages | string,
+): Promise<Record<string, string> | null> => {
+  try {
+    const entry = JSON.parse(
+      await fs.readFile(cacheFilePath(storagePath, language), 'utf-8'),
+      jsonReviver,
+    ) as ScopeFinalizeCacheEntry;
+    if (!isCacheEntry(entry)) return null;
+    if (entry.language !== language) return null;
+    return entry.surfaceHashes;
+  } catch {
+    return null;
+  }
 };
 
 export const saveScopeFinalizeCache = async (

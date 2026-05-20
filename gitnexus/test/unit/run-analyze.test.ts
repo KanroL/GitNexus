@@ -102,6 +102,7 @@ describe('run-analyze module', () => {
       '  artifactReplayDetails: freshReasons=none, missReasons=none, missSamples=none, artifactLoad=0ms, artifactIndexLoad=0ms, artifactShardLoad=0ms, artifactShardReads=0',
       '  scopeCounters: scopePreExtractedHits=18, scopePreExtractedMisses=19, scopeFilesExtracted=20, scopeFilesResolved=21, scopeFinalizeCacheHit=0, scopeFinalizeCacheMiss=0, scopeFinalizeCacheDisabledReason=none',
       '  scopeFinalizePatch: enabled=false, patchedFiles=0, reusedFiles=0, disabledReason=none',
+      '  semanticSurface: changedFiles=0, unchangedFiles=0, importerExpansionSkipped=0, finalizeInvalidationReason=none',
       '  scopePartial: enabled=false, disabledReason=none, affectedFiles=0, rawAffectedFiles=0, matchedAffectedFiles=0, unmatchedSamples=none, referenceSitesResolved=0, referenceSitesTotal=0, emitFiles=0',
       '  pipeline: total=91ms, scan=1ms, structure=2ms, markdown=3ms, cobol=4ms, parseExtract=4ms, routes=5ms, tools=6ms, orm=7ms, crossFile=6ms, scopeResolution=8ms, mro=9ms, communities=7ms, processes=8ms',
       '  scopeResolution: extract=30ms, finalize=31ms, propagate=32ms, resolve=33ms, emit=34ms',

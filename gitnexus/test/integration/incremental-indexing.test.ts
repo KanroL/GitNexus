@@ -283,6 +283,43 @@ describe('incremental indexing integration', () => {
     }
   }, 300_000);
 
+  it('modified tracked file does not take unchanged fast path from a subdirectory', async () => {
+    const repo = await setupRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'provider.ts'),
+        "export function value(): string { return 'changed'; }\n",
+      );
+
+      const { storagePath, lbugPath, metaPath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      const report = await buildStatusReport({
+        repoPath: repo.dbPath,
+        storagePath,
+        lbugPath,
+        metaPath,
+        meta: meta!,
+      });
+      expect(report.isUpToDate).toBe(false);
+      expect(report.changes.modified).toBe(1);
+
+      const logs: string[] = [];
+      const events: string[] = [];
+      const result = await runFullAnalysis(path.join(repo.dbPath, 'src'), analyzeOptions, {
+        onProgress: (phase) => events.push(phase),
+        onLog: (message) => logs.push(message),
+      });
+
+      expect(result.alreadyUpToDate).toBeUndefined();
+      expect(logs).not.toContain('Already up to date');
+      expect(events).toContain('extracting');
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+
   it('status is up to date after incremental analyze updates source hashes', async () => {
     const repo = await setupRepo();
     try {

@@ -50,6 +50,7 @@ import {
   getCurrentCommit,
   getRemoteUrl,
   hasGitDir,
+  getGitRoot,
   getInferredRepoName,
   resolveRepoIdentityRoot,
 } from '../storage/git.js';
@@ -290,6 +291,12 @@ export async function runFullAnalysis(
   options: AnalyzeOptions,
   callbacks: AnalyzeCallbacks,
 ): Promise<AnalyzeResult> {
+  // Keep analyze's hash universe aligned with `gitnexus status`, even when
+  // invoked from a subdirectory via `gitnexus analyze --incremental .`.
+  if (!options.skipGit) {
+    const gitRoot = getGitRoot(repoPath);
+    if (gitRoot) repoPath = gitRoot;
+  }
   const analyzeStart = Date.now();
   const log = (msg: string) => callbacks.onLog?.(msg);
   const progress = (phase: string, percent: number, message: string) =>

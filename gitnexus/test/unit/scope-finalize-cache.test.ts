@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { BindingRef, ParsedFile, Scope, SymbolDefinition } from 'gitnexus-shared';
 import { computeScopeFinalizeSurfaceHash } from '../../src/storage/scope-finalize-cache.js';
+import { extractParsedFile } from '../../src/core/ingestion/scope-extractor-bridge.js';
+import { typescriptProvider } from '../../src/core/ingestion/languages/typescript.js';
 
 const range = { startLine: 1, startCol: 0, endLine: 1, endCol: 1 };
 
@@ -65,6 +67,14 @@ const parsed = (input: {
   };
 };
 
+const parseTs = (source: string): ParsedFile => {
+  const parsedFile = extractParsedFile(typescriptProvider, source, 'src/mod.ts');
+  expect(parsedFile).toBeDefined();
+  return parsedFile!;
+};
+
+const hashTs = (source: string): string => computeScopeFinalizeSurfaceHash(parseTs(source));
+
 describe('scope finalize semantic surface hash', () => {
   it('ignores implementation-only body changes', () => {
     const exported = def('value', { nodeId: 'Function:src/mod.ts:value:1-3' });
@@ -109,5 +119,32 @@ describe('scope finalize semantic surface hash', () => {
         parsed({ moduleDefs: [def('User', { type: 'Interface', qualifiedName: 'User', declaredType: '{ id: number }' })] }),
       ),
     );
+  });
+
+  it('keeps real TypeScript body, comment, literal, whitespace, and local rename edits stable', () => {
+    const base = `export function value(name: string): string {
+  const local = 'one';
+  return name + local;
+}
+`;
+    expect(hashTs(`// changed comment
+${base}`)).toBe(hashTs(base));
+    expect(hashTs(base.replace("'one'", "'two'"))).toBe(hashTs(base));
+    expect(hashTs(base.replace('const local', 'const renamed').replace('local;', 'renamed;'))).toBe(hashTs(base));
+    expect(hashTs(base.replace('return name + local;', 'return `${name}${local}`;'))).toBe(hashTs(base));
+    expect(hashTs(base.replace('  const local', '    const local'))).toBe(hashTs(base));
+  });
+
+  it('changes real TypeScript surface for imports, export names, signatures, and type shapes', () => {
+    const base = `import { a } from './a';
+export function value(name: string): string {
+  return name + a();
+}
+export class User { id = 'x' }
+`;
+    expect(hashTs(base.replace("{ a }", "{ b as a }"))).not.toBe(hashTs(base));
+    expect(hashTs(base.replace('value', 'renamedValue'))).not.toBe(hashTs(base));
+    expect(hashTs(base.replace('name: string', 'name: number'))).not.toBe(hashTs(base));
+    expect(hashTs(base.replace('id', 'name'))).not.toBe(hashTs(base));
   });
 });

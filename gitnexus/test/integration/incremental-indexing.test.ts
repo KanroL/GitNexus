@@ -379,6 +379,7 @@ describe('incremental indexing integration', () => {
 
   it('body-only incremental edit reuses cached scope finalize output', async () => {
     const repo = await setupRepo();
+    const previousVerbose = process.env.GITNEXUS_VERBOSE;
     const workerOptions = {
       ...analyzeOptions,
       workerThresholdsForTest: { minFiles: 1, minBytes: 1 },
@@ -406,7 +407,9 @@ export function useValue(): string {
 }
 `,
       );
-      const cached = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
+      const logs: string[] = [];
+      process.env.GITNEXUS_VERBOSE = '1';
+      const cached = await runFullAnalysis(repo.dbPath, workerOptions, callbacks(logs));
       expect(cached.alreadyUpToDate).toBeUndefined();
       expect(cached.pipelineResult?.scopeStats.finalizeCacheHits).toBeGreaterThan(0);
       expect(cached.pipelineResult?.scopeStats.partialEnabled).toBe(true);
@@ -418,7 +421,14 @@ export function useValue(): string {
         cached.pipelineResult!.scopeStats.filesResolved,
       );
       expect(cached.pipelineResult?.scopeStats.partialAffectedFiles).toBeGreaterThan(0);
+      expect(logs).toContain(
+        '  semanticSurface: changedFiles=0, unchangedFiles=1, importerExpansionSkipped=1, finalizeInvalidationReason=none',
+      );
+      expect(logs.some((line) => line.includes('scopeFinalizeCacheHit=1'))).toBe(true);
+      expect(logs.some((line) => line.includes('scopePartial: enabled=true'))).toBe(true);
     } finally {
+      if (previousVerbose === undefined) delete process.env.GITNEXUS_VERBOSE;
+      else process.env.GITNEXUS_VERBOSE = previousVerbose;
       await repo.cleanup();
     }
   }, 600_000);

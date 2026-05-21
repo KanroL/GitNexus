@@ -35,7 +35,12 @@ import {
   INCREMENTAL_SCHEMA_VERSION,
 } from '../storage/repo-manager.js';
 import { computeFileHashes } from '../storage/file-hash.js';
-import { computeScopeFinalizeSurfaceHash, loadScopeFinalizeSurfaceHashes } from '../storage/scope-finalize-cache.js';
+import {
+  computeScopeFinalizeSurfaceHash,
+  computeSemanticFinalizeSurface,
+  loadScopeFinalizeSemanticSurfaces,
+  type SemanticFinalizeSurface,
+} from '../storage/scope-finalize-cache.js';
 import { walkRepositoryPaths } from './ingestion/filesystem-walker.js';
 import { extractParsedFile } from './ingestion/scope-extractor-bridge.js';
 import { typescriptProvider, javascriptProvider } from './ingestion/languages/typescript.js';
@@ -285,23 +290,31 @@ const computeChangedSemanticSurface = async (
   repoPath: string,
   storagePath: string,
   changedFiles: readonly string[],
+  log?: (message: string) => void,
 ): Promise<{
   unchangedFiles: Set<string>;
   changedCount: number;
   unchangedCount: number;
   invalidationReason?: string;
 }> => {
-  const previousHashes = await loadScopeFinalizeSurfaceHashes(storagePath, SupportedLanguages.TypeScript);
-  if (previousHashes === null) {
-    return { unchangedFiles: new Set(), changedCount: 0, unchangedCount: 0, invalidationReason: 'missing semantic surface cache' };
-  }
+  const previousByLanguage = new Map<SupportedLanguages, Awaited<ReturnType<typeof loadScopeFinalizeSemanticSurfaces>>>();
   const unchangedFiles = new Set<string>();
   let changedCount = 0;
   let unchangedCount = 0;
+  let missingSurfaceCache = false;
   for (const filePath of changedFiles) {
     const language = getLanguageFromFilename(filePath);
     const provider = language === SupportedLanguages.TypeScript ? typescriptProvider : language === SupportedLanguages.JavaScript ? javascriptProvider : undefined;
     if (provider === undefined) {
+      changedCount++;
+      continue;
+    }
+    if (!previousByLanguage.has(language)) {
+      previousByLanguage.set(language, await loadScopeFinalizeSemanticSurfaces(storagePath, language));
+    }
+    const previous = previousByLanguage.get(language);
+    if (previous === null || previous === undefined) {
+      missingSurfaceCache = true;
       changedCount++;
       continue;
     }
@@ -312,10 +325,13 @@ const computeChangedSemanticSurface = async (
       continue;
     }
     const currentHash = computeScopeFinalizeSurfaceHash(parsed);
-    if (previousHashes[filePath] === currentHash) {
+    if (previous.hashes[filePath] === currentHash) {
       unchangedFiles.add(filePath);
       unchangedCount++;
     } else {
+      if (isAnalyzeProfilingEnabled()) {
+        log?.(formatSemanticSurfaceDiff(filePath, previous.hashes[filePath], currentHash, previous.surfaces[filePath], computeSemanticFinalizeSurface(parsed)));
+      }
       changedCount++;
     }
   }
@@ -323,9 +339,47 @@ const computeChangedSemanticSurface = async (
     unchangedFiles,
     changedCount,
     unchangedCount,
-    invalidationReason: changedCount > 0 ? 'semantic surface changed' : undefined,
+    invalidationReason: missingSurfaceCache ? 'missing semantic surface cache' : changedCount > 0 ? 'semantic surface changed' : undefined,
   };
 };
+
+const formatSemanticSurfaceDiff = (
+  filePath: string,
+  oldHash: string | undefined,
+  newHash: string,
+  oldSurface: SemanticFinalizeSurface | undefined,
+  newSurface: SemanticFinalizeSurface,
+): string => {
+  const importsChanged = stableString(oldSurface?.imports ?? []) !== stableString(newSurface.imports);
+  const oldDefs = oldSurface?.moduleVisibleDefs ?? [];
+  const newDefs = newSurface.moduleVisibleDefs;
+  const callableSignaturesChanged = stableString(oldDefs.filter(isCallableSurfaceDefLike)) !== stableString(newDefs.filter(isCallableSurfaceDefLike));
+  const typeSignaturesChanged = stableString(oldDefs.filter(isTypeSurfaceDefLike)) !== stableString(newDefs.filter(isTypeSurfaceDefLike));
+  const exportsChanged = stableString(oldDefs.map(surfaceName).sort()) !== stableString(newDefs.map(surfaceName).sort());
+  const countsChanged = stableString(oldSurface?.counts ?? {}) !== stableString(newSurface.counts);
+  const suspected = [
+    oldHash === undefined ? 'missing-old-hash' : undefined,
+    oldSurface === undefined ? 'missing-old-surface' : undefined,
+    !importsChanged && !exportsChanged && !callableSignaturesChanged && !typeSignaturesChanged && countsChanged ? 'count-only-drift' : undefined,
+  ].filter((x): x is string => x !== undefined);
+  return `Semantic surface changed: file=${filePath}, oldHash=${oldHash ?? 'missing'}, newHash=${newHash}, importsChanged=${importsChanged}, exportsChanged=${exportsChanged}, callableSignaturesChanged=${callableSignaturesChanged}, typeInterfaceSignaturesChanged=${typeSignaturesChanged}, moduleScopeChanged=${exportsChanged}, localDefsChanged=${stableString(oldDefs) !== stableString(newDefs)}, countsChanged=${countsChanged}, suspectedUnstableFields=${suspected.join('|') || 'none'}`;
+};
+
+const stableString = (value: unknown): string => JSON.stringify(normalizeDiagnosticValue(value));
+const normalizeDiagnosticValue = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(normalizeDiagnosticValue);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = normalizeDiagnosticValue((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+};
+const surfaceName = (value: unknown): string => String((value as { qualifiedName?: unknown }).qualifiedName ?? '');
+const isCallableSurfaceDefLike = (value: unknown): boolean => ['Function', 'Method', 'Constructor'].includes(String((value as { type?: unknown }).type));
+const isTypeSurfaceDefLike = (value: unknown): boolean => ['Class', 'Interface', 'Type', 'Enum', 'Struct', 'Union'].includes(String((value as { type?: unknown }).type));
 
 const sumProfileMajorTimings = (timings: AnalyzeProfileTimings): number =>
   timings.preflightMs +
@@ -651,7 +705,7 @@ export async function runFullAnalysis(
     incrementalFreshFiles = new Set(hashDiff.toWrite);
     const priorFileSet = new Set(existingMeta?.fileHashes ? Object.keys(existingMeta.fileHashes) : []);
     const semanticSurface = hashDiff.added.length === 0 && hashDiff.deleted.length === 0
-      ? await computeChangedSemanticSurface(repoPath, storagePath, hashDiff.changed)
+      ? await computeChangedSemanticSurface(repoPath, storagePath, hashDiff.changed, log)
       : { unchangedFiles: new Set<string>(), changedCount: hashDiff.changed.length, unchangedCount: 0, invalidationReason: 'file set changed' };
     semanticSurfaceChangedFiles = semanticSurface.changedCount;
     semanticSurfaceUnchangedFiles = semanticSurface.unchangedCount;

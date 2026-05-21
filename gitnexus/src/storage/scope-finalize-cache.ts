@@ -11,7 +11,7 @@ import type {
   SupportedLanguages,
 } from 'gitnexus-shared';
 
-const SCOPE_FINALIZE_CACHE_SCHEMA_VERSION = 2;
+const SCOPE_FINALIZE_CACHE_SCHEMA_VERSION = 3;
 export const SCOPE_FINALIZE_CACHE_VERSION = String(SCOPE_FINALIZE_CACHE_SCHEMA_VERSION);
 
 const CACHE_DIRNAME = 'scope-finalize-cache';
@@ -26,6 +26,7 @@ export interface ScopeFinalizeCacheEntry {
   resolutionConfigHash: string;
   filePaths: string[];
   surfaceHashes: Record<string, string>;
+  semanticSurfaces?: Record<string, SemanticFinalizeSurface>;
   imports: SerializedImports;
   bindings: SerializedBindings;
   sccs: readonly FinalizedScc[];
@@ -45,6 +46,19 @@ export interface ScopeFinalizeCacheMetadata {
   resolutionConfigHash: string;
   filePaths: string[];
   surfaceHashes: Record<string, string>;
+  semanticSurfaces: Record<string, SemanticFinalizeSurface>;
+}
+
+export interface SemanticFinalizeSurface {
+  filePath: string;
+  imports: unknown[];
+  moduleVisibleDefs: unknown[];
+  counts: {
+    imports: number;
+    moduleVisibleDefs: number;
+    callableSignatures: number;
+    typeSignatures: number;
+  };
 }
 
 export interface ScopeFinalizeCacheHit {
@@ -108,14 +122,24 @@ const cacheFilePath = (storagePath: string, language: SupportedLanguages | strin
   path.join(storagePath, CACHE_DIRNAME, `${String(language).replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
 
 export const computeScopeFinalizeSurfaceHash = (parsed: ParsedFile): string =>
-  sha256Hex(
-    stableJson({
-      filePath: parsed.filePath,
-      moduleScope: parsed.moduleScope,
-      parsedImports: parsed.parsedImports,
-      moduleSurfaceDefs: collectSemanticModuleSurfaceDefs(parsed),
-    }),
-  );
+  sha256Hex(stableJson(computeSemanticFinalizeSurface(parsed)));
+
+export const computeSemanticFinalizeSurface = (parsed: ParsedFile): SemanticFinalizeSurface => {
+  const moduleVisibleDefs = collectSemanticModuleSurfaceDefs(parsed);
+  return {
+    filePath: parsed.filePath,
+    imports: [...parsed.parsedImports]
+      .map(normalizeParsedImport)
+      .sort((a, b) => stableJson(a).localeCompare(stableJson(b))),
+    moduleVisibleDefs,
+    counts: {
+      imports: parsed.parsedImports.length,
+      moduleVisibleDefs: moduleVisibleDefs.length,
+      callableSignatures: moduleVisibleDefs.filter(isCallableSurfaceDef).length,
+      typeSignatures: moduleVisibleDefs.filter(isTypeSurfaceDef).length,
+    },
+  };
+};
 
 export const semanticDefKey = (def: BindingRef['def']): string =>
   stableJson({
@@ -144,18 +168,65 @@ const collectSemanticModuleSurfaceDefs = (parsed: ParsedFile): unknown[] => {
   if (defs.size === 0) {
     for (const def of parsed.localDefs) defs.set(semanticDefKey(def), def);
   }
-  return Array.from(defs.values())
-    .map((def) => ({
-      type: def.type,
-      qualifiedName: def.qualifiedName,
-      parameterCount: def.parameterCount,
-      requiredParameterCount: def.requiredParameterCount,
-      parameterTypes: def.parameterTypes,
-      returnType: def.returnType,
-      declaredType: def.declaredType,
-      templateArguments: def.templateArguments,
-    }))
-    .sort((a, b) => stableJson(a).localeCompare(stableJson(b)));
+  const moduleDefs = Array.from(defs.values());
+  const surfaceDefs = [
+    ...moduleDefs.map(normalizeSurfaceDef),
+    ...collectModuleVisibleMemberDefs(parsed, moduleDefs),
+  ];
+  return surfaceDefs.sort((a, b) => stableJson(a).localeCompare(stableJson(b)));
+};
+
+const normalizeSurfaceDef = (def: BindingRef['def']): unknown => ({
+  type: def.type,
+  qualifiedName: def.qualifiedName,
+  parameterCount: def.parameterCount,
+  requiredParameterCount: def.requiredParameterCount,
+  parameterTypes: def.parameterTypes ?? [],
+  returnType: def.returnType,
+  declaredType: def.declaredType,
+  templateArguments: def.templateArguments ?? [],
+});
+
+const collectModuleVisibleMemberDefs = (
+  parsed: ParsedFile,
+  moduleDefs: readonly BindingRef['def'][],
+): unknown[] => {
+  const visibleTypeNames = new Set(
+    moduleDefs
+      .filter(isContainerSurfaceDef)
+      .map((def) => def.qualifiedName)
+      .filter((name): name is string => typeof name === 'string' && name.length > 0),
+  );
+  if (visibleTypeNames.size === 0) return [];
+  const memberDefs: unknown[] = [];
+  for (const scope of parsed.scopes) {
+    if (scope.kind !== 'Class') continue;
+    const owner = scope.ownedDefs.find((def) => def.qualifiedName !== undefined && visibleTypeNames.has(def.qualifiedName));
+    if (owner?.qualifiedName === undefined) continue;
+    for (const def of scope.ownedDefs) {
+      if (def === owner || !isMemberSurfaceDef(def)) continue;
+      memberDefs.push({ owner: owner.qualifiedName, ...(normalizeSurfaceDef(def) as Record<string, unknown>) });
+    }
+  }
+  return memberDefs;
+};
+
+const isContainerSurfaceDef = (def: BindingRef['def']): boolean =>
+  def.type === 'Class' || def.type === 'Interface' || def.type === 'Struct' || def.type === 'Enum';
+
+const isMemberSurfaceDef = (def: BindingRef['def']): boolean =>
+  def.type === 'Property' || def.type === 'Method' || def.type === 'Constructor';
+
+const normalizeParsedImport = (parsedImport: unknown): unknown => normalizeForStableJson(parsedImport);
+
+const isCallableSurfaceDef = (value: unknown): boolean => {
+  const def = value as { type?: unknown };
+  return def.type === 'Function' || def.type === 'Method' || def.type === 'Constructor';
+};
+
+const isTypeSurfaceDef = (value: unknown): boolean => {
+  const def = value as { type?: unknown };
+  return def.type === 'Class' || def.type === 'Interface' || def.type === 'Type' || def.type === 'Enum' || def.type === 'Struct' || def.type === 'Union';
 };
 
 export const computeResolutionConfigHash = (resolutionConfig: unknown): string =>
@@ -214,10 +285,13 @@ export const buildScopeFinalizeCacheMetadata = (
 ): ScopeFinalizeCacheMetadata => {
   const filePaths = parsedFiles.map((f) => f.filePath).sort();
   const surfaceHashes: Record<string, string> = {};
+  const semanticSurfaces: Record<string, SemanticFinalizeSurface> = {};
   for (const parsed of parsedFiles) {
-    surfaceHashes[parsed.filePath] = computeScopeFinalizeSurfaceHash(parsed);
+    const surface = computeSemanticFinalizeSurface(parsed);
+    semanticSurfaces[parsed.filePath] = surface;
+    surfaceHashes[parsed.filePath] = sha256Hex(stableJson(surface));
   }
-  return { language, providerId, resolutionConfigHash, filePaths, surfaceHashes };
+  return { language, providerId, resolutionConfigHash, filePaths, surfaceHashes, semanticSurfaces };
 };
 
 export const loadScopeFinalizeCache = async (
@@ -278,6 +352,23 @@ export const loadScopeFinalizeSurfaceHashes = async (
   }
 };
 
+export const loadScopeFinalizeSemanticSurfaces = async (
+  storagePath: string,
+  language: SupportedLanguages | string,
+): Promise<{ hashes: Record<string, string>; surfaces: Record<string, SemanticFinalizeSurface> } | null> => {
+  try {
+    const entry = JSON.parse(
+      await fs.readFile(cacheFilePath(storagePath, language), 'utf-8'),
+      jsonReviver,
+    ) as ScopeFinalizeCacheEntry;
+    if (!isCacheEntry(entry)) return null;
+    if (entry.language !== language) return null;
+    return { hashes: entry.surfaceHashes, surfaces: entry.semanticSurfaces ?? {} };
+  } catch {
+    return null;
+  }
+};
+
 export const saveScopeFinalizeCache = async (
   storagePath: string,
   metadata: ScopeFinalizeCacheMetadata,
@@ -292,6 +383,7 @@ export const saveScopeFinalizeCache = async (
     resolutionConfigHash: metadata.resolutionConfigHash,
     filePaths: metadata.filePaths,
     surfaceHashes: metadata.surfaceHashes,
+    semanticSurfaces: metadata.semanticSurfaces,
     imports: serializeImports(output.imports),
     bindings: serializeBindings(output.bindings),
     sccs: output.sccs,

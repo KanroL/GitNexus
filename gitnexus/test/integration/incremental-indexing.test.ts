@@ -4,6 +4,7 @@ import path from 'path';
 import { describe, expect, it } from 'vitest';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
 import { closeLbug, executeQuery, initLbug } from '../../src/core/lbug/lbug-adapter.js';
+import { searchFTSFromLbug } from '../../src/core/search/bm25-index.js';
 import { getStoragePaths, loadMeta } from '../../src/storage/repo-manager.js';
 import { getFileArtifactCacheDir, loadFileParseArtifact } from '../../src/storage/file-artifact-cache.js';
 import { buildStatusReport } from '../../src/cli/status.js';
@@ -66,6 +67,86 @@ async function setupWorkerArtifactRepo() {
     );
   }
   await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"artifact-replay-fixture"}\n');
+  execSync('git init', { cwd: repo.dbPath, stdio: 'pipe' });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m initial', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  return repo;
+}
+
+async function setupCrossFileRelationshipRepo() {
+  const repo = await createTempDir('gitnexus-cross-file-rel-int-');
+  const src = path.join(repo.dbPath, 'src');
+  await mkdir(src, { recursive: true });
+  await writeFile(
+    path.join(src, 'api.ts'),
+    `export function greet(name: string): string {
+  return 'hi ' + name;
+}
+`,
+  );
+  await writeFile(
+    path.join(src, 'user.ts'),
+    `import { greet } from './api';
+
+export function makeMessage(): string {
+  return greet('Ada');
+}
+`,
+  );
+  await writeFile(
+    path.join(src, 'index.ts'),
+    `import { makeMessage } from './user';
+
+export function run(): string {
+  return makeMessage();
+}
+`,
+  );
+  await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"cross-file-fixture"}\n');
+  execSync('git init', { cwd: repo.dbPath, stdio: 'pipe' });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m initial', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  return repo;
+}
+
+async function setupSearchFreshnessRepo() {
+  const repo = await createTempDir('gitnexus-test-search-fresh-');
+  const src = path.join(repo.dbPath, 'src');
+  await mkdir(src, { recursive: true });
+  await writeFile(
+    path.join(src, 'keep.ts'),
+    `export function keepToken(): string {
+  return 'freshnesskeepterm';
+}
+`,
+  );
+  await writeFile(
+    path.join(src, 'change.ts'),
+    `export function changedToken(): string {
+  return 'freshnessoldterm';
+}
+`,
+  );
+  await writeFile(
+    path.join(src, 'remove.ts'),
+    `export function removedToken(): string {
+  return 'freshnessremoveterm';
+}
+`,
+  );
+  await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"search-fresh-fixture"}\n');
   execSync('git init', { cwd: repo.dbPath, stdio: 'pipe' });
   execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
     cwd: repo.dbPath,
@@ -198,6 +279,89 @@ async function persistentStructureTopology(repoPath: string): Promise<{
       )
       .sort(),
   };
+}
+
+async function crossFileRelationshipTopology(repoPath: string): Promise<{
+  imports: string[];
+  calls: string[];
+}> {
+  const relationshipPairs = [
+    ['File', 'File'],
+    ['Function', 'Function'],
+    ['Function', 'Method'],
+    ['Method', 'Function'],
+    ['Method', 'Method'],
+  ] as const;
+  const rows: Array<{
+    sourceLabel: string;
+    sourceId: string;
+    sourceName: string;
+    sourcePath: string;
+    targetLabel: string;
+    targetId: string;
+    targetName: string;
+    targetPath: string;
+    type: string;
+  }> = [];
+
+  for (const [sourceLabel, targetLabel] of relationshipPairs) {
+    rows.push(
+      ...(await queryRepo<{
+        sourceId: string;
+        sourceName: string;
+        sourcePath: string;
+        targetId: string;
+        targetName: string;
+        targetPath: string;
+        type: string;
+      }>(
+        repoPath,
+        `MATCH (a:${sourceLabel})-[r:CodeRelation]->(b:${targetLabel})
+         WHERE (r.type = 'IMPORTS' OR r.type = 'CALLS') AND a.filePath <> b.filePath
+         RETURN a.id AS sourceId, a.name AS sourceName, a.filePath AS sourcePath,
+                b.id AS targetId, b.name AS targetName, b.filePath AS targetPath,
+                r.type AS type`,
+      )).map((row) => ({
+        ...row,
+        sourceLabel,
+        targetLabel,
+      })),
+    );
+  }
+
+  const serialize = (row: (typeof rows)[number]) =>
+    `${row.type}:${row.sourceLabel}:${row.sourceId}|${row.sourceName}|${row.sourcePath}` +
+    `->${row.targetLabel}:${row.targetId}|${row.targetName}|${row.targetPath}`;
+
+  return {
+    imports: rows.filter((row) => row.type === 'IMPORTS').map(serialize).sort(),
+    calls: rows.filter((row) => row.type === 'CALLS').map(serialize).sort(),
+  };
+}
+
+async function searchFreshnessSnapshot(
+  repoPath: string,
+  tokens: readonly string[],
+): Promise<Record<string, { ftsAvailable: boolean; filePaths: string[]; nodeIds: string[] }>> {
+  const { lbugPath } = getStoragePaths(repoPath);
+  await initLbug(lbugPath);
+  try {
+    const snapshot: Record<
+      string,
+      { ftsAvailable: boolean; filePaths: string[]; nodeIds: string[] }
+    > = {};
+    for (const token of tokens) {
+      const { results, ftsAvailable } = await searchFTSFromLbug(token, 10);
+      snapshot[token] = {
+        ftsAvailable,
+        filePaths: results.map((result) => result.filePath).sort(),
+        nodeIds: results.flatMap((result) => result.nodeIds ?? []).sort(),
+      };
+    }
+    return snapshot;
+  } finally {
+    await closeLbug();
+  }
 }
 
 async function assertIncrementalMatchesForce(repoPath: string) {
@@ -805,6 +969,87 @@ export function useValue(): string {
       expect(await countFunctionsNamed(repo.dbPath, 'renamedValue')).toBe(1);
       await assertIncrementalMatchesForce(repo.dbPath);
     } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('incremental cross-file relationships match force rebuild after export change', async () => {
+    const repo = await setupCrossFileRelationshipRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'api.ts'),
+        `export function greetUser(name: string): string {
+  return 'hi ' + name;
+}
+`,
+      );
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'user.ts'),
+        `import { greetUser } from './api';
+
+export function makeMessage(): string {
+  return greetUser('Ada');
+}
+`,
+      );
+
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      const incrementalTopology = await crossFileRelationshipTopology(repo.dbPath);
+
+      expect(incrementalTopology.imports.length).toBeGreaterThan(0);
+      expect(incrementalTopology.calls.length).toBeGreaterThan(0);
+      expect(incrementalTopology.calls.some((rel) => rel.includes('greetUser'))).toBe(true);
+      expect(
+        incrementalTopology.calls.some((rel) => rel.includes('Function:src/api.ts:greet|greet|')),
+      ).toBe(false);
+
+      await runFullAnalysis(repo.dbPath, { ...analyzeOptions, force: true }, callbacks());
+      const forceTopology = await crossFileRelationshipTopology(repo.dbPath);
+
+      expect(incrementalTopology).toEqual(forceTopology);
+    } finally {
+      await closeLbug();
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('incremental search index matches force rebuild after changed and deleted files', async () => {
+    const repo = await setupSearchFreshnessRepo();
+    const tokens = [
+      'freshnesskeepterm',
+      'freshnessoldterm',
+      'freshnessnewterm',
+      'freshnessremoveterm',
+    ] as const;
+    try {
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'change.ts'),
+        `export function changedToken(): string {
+  return 'freshnessnewterm';
+}
+`,
+      );
+      await rm(path.join(repo.dbPath, 'src', 'remove.ts'));
+
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      const incrementalSnapshot = await searchFreshnessSnapshot(repo.dbPath, tokens);
+
+      expect(Object.values(incrementalSnapshot).every((result) => result.ftsAvailable)).toBe(true);
+      expect(incrementalSnapshot.freshnesskeepterm.filePaths).toContain('src/keep.ts');
+      expect(incrementalSnapshot.freshnessnewterm.filePaths).toContain('src/change.ts');
+      expect(incrementalSnapshot.freshnessoldterm.filePaths).not.toContain('src/change.ts');
+      expect(incrementalSnapshot.freshnessoldterm.filePaths).toHaveLength(0);
+      expect(incrementalSnapshot.freshnessremoveterm.filePaths).not.toContain('src/remove.ts');
+      expect(incrementalSnapshot.freshnessremoveterm.filePaths).toHaveLength(0);
+
+      await runFullAnalysis(repo.dbPath, { ...analyzeOptions, force: true }, callbacks());
+      const forceSnapshot = await searchFreshnessSnapshot(repo.dbPath, tokens);
+
+      expect(incrementalSnapshot).toEqual(forceSnapshot);
+    } finally {
+      await closeLbug();
       await repo.cleanup();
     }
   }, 600_000);

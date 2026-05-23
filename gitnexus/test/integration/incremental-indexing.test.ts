@@ -148,6 +148,58 @@ async function structureTopology(repoPath: string): Promise<{
   };
 }
 
+async function persistentStructureTopology(repoPath: string): Promise<{
+  files: string[];
+  folders: string[];
+  containsRelationships: string[];
+}> {
+  const fileRows = await queryRepo<{ id: string; name: string; filePath: string }>(
+    repoPath,
+    `MATCH (f:File) RETURN f.id AS id, f.name AS name, f.filePath AS filePath`,
+  );
+  const folderRows = await queryRepo<{ id: string; name: string; filePath: string }>(
+    repoPath,
+    `MATCH (f:Folder) RETURN f.id AS id, f.name AS name, f.filePath AS filePath`,
+  );
+  const folderToFolderRows = await queryRepo<{
+    sourceId: string;
+    sourcePath: string;
+    targetId: string;
+    targetPath: string;
+    type: string;
+  }>(
+    repoPath,
+    `MATCH (a:Folder)-[r:CodeRelation]->(b:Folder)
+     WHERE r.type = 'CONTAINS'
+     RETURN a.id AS sourceId, a.filePath AS sourcePath,
+            b.id AS targetId, b.filePath AS targetPath, r.type AS type`,
+  );
+  const folderToFileRows = await queryRepo<{
+    sourceId: string;
+    sourcePath: string;
+    targetId: string;
+    targetPath: string;
+    type: string;
+  }>(
+    repoPath,
+    `MATCH (a:Folder)-[r:CodeRelation]->(b:File)
+     WHERE r.type = 'CONTAINS'
+     RETURN a.id AS sourceId, a.filePath AS sourcePath,
+            b.id AS targetId, b.filePath AS targetPath, r.type AS type`,
+  );
+
+  return {
+    files: fileRows.map((row) => `${row.id}|${row.name}|${row.filePath}`).sort(),
+    folders: folderRows.map((row) => `${row.id}|${row.name}|${row.filePath}`).sort(),
+    containsRelationships: [...folderToFolderRows, ...folderToFileRows]
+      .map(
+        (row) =>
+          `${row.type}:${row.sourceId}|${row.sourcePath}->${row.targetId}|${row.targetPath}`,
+      )
+      .sort(),
+  };
+}
+
 async function assertIncrementalMatchesForce(repoPath: string) {
   const incrementalMeta = await loadMeta(getStoragePaths(repoPath).storagePath);
   const incrementalStats = await graphStats(repoPath);
@@ -686,6 +738,50 @@ export function useValue(): string {
             'src/moved/nested->src/moved/nested/renamed.ts',
           ]),
         );
+      } finally {
+        await closeLbug();
+        await repo.cleanup();
+      }
+    }, 600_000);
+
+    it('incremental structure topology matches force rebuild after add delete and move', async () => {
+      const repo = await setupRepo();
+      try {
+        await mkdir(path.join(repo.dbPath, 'src', 'obsolete'), { recursive: true });
+        await writeFile(
+          path.join(repo.dbPath, 'src', 'obsolete', 'old.ts'),
+          'export function old(): number { return 1; }\n',
+        );
+        await mkdir(path.join(repo.dbPath, 'src', 'old'), { recursive: true });
+        await writeFile(
+          path.join(repo.dbPath, 'src', 'old', 'moved.ts'),
+          'export function moved(): number { return 2; }\n',
+        );
+        await writeFile(
+          path.join(repo.dbPath, 'src', 'shared.ts'),
+          'export function shared(): number { return 3; }\n',
+        );
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+
+        await mkdir(path.join(repo.dbPath, 'src', 'new', 'nested'), { recursive: true });
+        await writeFile(
+          path.join(repo.dbPath, 'src', 'new', 'nested', 'added.ts'),
+          'export function added(): number { return 4; }\n',
+        );
+        await rm(path.join(repo.dbPath, 'src', 'obsolete', 'old.ts'));
+        await mkdir(path.join(repo.dbPath, 'src', 'new', 'location'), { recursive: true });
+        await rename(
+          path.join(repo.dbPath, 'src', 'old', 'moved.ts'),
+          path.join(repo.dbPath, 'src', 'new', 'location', 'moved.ts'),
+        );
+
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+        const incrementalTopology = await persistentStructureTopology(repo.dbPath);
+
+        await runFullAnalysis(repo.dbPath, { ...analyzeOptions, force: true }, callbacks());
+        const forceTopology = await persistentStructureTopology(repo.dbPath);
+
+        expect(incrementalTopology).toEqual(forceTopology);
       } finally {
         await closeLbug();
         await repo.cleanup();

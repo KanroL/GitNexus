@@ -6,6 +6,8 @@
  * replaced, produce a smaller KnowledgeGraph that contains:
  *
  *   - Every node whose `properties.filePath` is in `toWriteSet`.
+ *   - Folder ancestors for writable files, so new nested files can be
+ *     written with their structure chain intact.
  *   - Every graph-wide node (Community, Process) — these are regenerated
  *     each run by the communities/processes phases and must be fully
  *     rewritten.
@@ -54,6 +56,19 @@ import type { KnowledgeGraph } from '../graph/types.js';
 
 const isGraphWide = (label: string): boolean => label === 'Community' || label === 'Process';
 
+const collectFolderAncestorPaths = (filePaths: ReadonlySet<string>): Set<string> => {
+  const ancestors = new Set<string>();
+  for (const filePath of filePaths) {
+    const parts = filePath.replace(/\\/g, '/').split('/').filter(Boolean);
+    let current = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      current = current ? `${current}/${parts[i]}` : parts[i]!;
+      ancestors.add(current);
+    }
+  }
+  return ancestors;
+};
+
 /**
  * Build a Map<nodeId, filePath> for every File-bound node in the graph.
  * Graph-wide nodes (Community/Process) have no filePath and are filtered.
@@ -72,19 +87,32 @@ export const extractChangedSubgraph = (
   toWriteSet: ReadonlySet<string>,
 ): KnowledgeGraph => {
   const sub = createKnowledgeGraph();
-  const writableNodeIds = new Set<string>();
+  const structuralFolderPaths = collectFolderAncestorPaths(toWriteSet);
+  const includedNodeIds = new Set<string>();
+  const writableBoundaryNodeIds = new Set<string>();
 
   fullGraph.forEachNode((n: GraphNode) => {
     const filePath = n.properties?.filePath as string | undefined;
-    const include = (filePath && toWriteSet.has(filePath)) || isGraphWide(n.label);
+    const isOriginalWritable =
+      (filePath !== undefined && toWriteSet.has(filePath)) || isGraphWide(n.label);
+    const isStructuralFolder =
+      n.label === 'Folder' && filePath !== undefined && structuralFolderPaths.has(filePath);
+    const include = isOriginalWritable || isStructuralFolder;
     if (include) {
       sub.addNode(n);
-      writableNodeIds.add(n.id);
+      includedNodeIds.add(n.id);
+      if (isOriginalWritable) writableBoundaryNodeIds.add(n.id);
     }
   });
 
   fullGraph.forEachRelationship((r: GraphRelationship) => {
-    if (writableNodeIds.has(r.sourceId) || writableNodeIds.has(r.targetId)) {
+    // Structural folders are included to complete the changed file's
+    // ancestor chain, but they must not pull unrelated sibling files.
+    const includeStructuralContains =
+      r.type === 'CONTAINS' && includedNodeIds.has(r.sourceId) && includedNodeIds.has(r.targetId);
+    const includeWritableBoundary =
+      writableBoundaryNodeIds.has(r.sourceId) || writableBoundaryNodeIds.has(r.targetId);
+    if (includeStructuralContains || includeWritableBoundary) {
       sub.addRelationship(r);
     }
   });

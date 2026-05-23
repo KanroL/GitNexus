@@ -807,6 +807,21 @@ const escapeTableName = (table: string): string => {
   return BACKTICK_TABLES.has(table) ? `\`${table}\`` : table;
 };
 
+const escapeCypherString = (value: string): string => value.replace(/'/g, "''");
+
+const normalizeGraphPath = (filePath: string): string => filePath.replace(/\\/g, '/');
+
+const folderAncestorsDeepestFirst = (filePath: string): string[] => {
+  const parts = normalizeGraphPath(filePath).split('/').filter(Boolean);
+  const ancestors: string[] = [];
+  for (let i = parts.length - 2; i >= 0; i--) {
+    ancestors.push(parts.slice(0, i + 1).join('/'));
+  }
+  return ancestors;
+};
+
+const firstCount = (rows: any[]): number => Number(rows?.[0]?.cnt ?? rows?.[0]?.[0] ?? 0);
+
 /** Fallback: insert relationships one-by-one if COPY fails */
 const fallbackRelationshipInserts = async (
   validRelLines: string[],
@@ -1400,6 +1415,64 @@ export const closeLbug = async (): Promise<void> => {
 
 export const isLbugReady = (): boolean => conn !== null && db !== null;
 
+const countFolderChildren = async (targetConn: lbug.Connection, folderPath: string): Promise<number> => {
+  const escaped = escapeCypherString(folderPath);
+  const rows = await readQueryRows(
+    await targetConn.query(
+      `MATCH (f:Folder)-[r:${REL_TABLE_NAME}]->(child) ` +
+        `WHERE f.filePath = '${escaped}' AND r.type = 'CONTAINS' RETURN count(child) AS cnt`,
+    ),
+  );
+  return firstCount(rows);
+};
+
+const countFolderNonContainsRelationships = async (
+  targetConn: lbug.Connection,
+  folderPath: string,
+): Promise<number> => {
+  const escaped = escapeCypherString(folderPath);
+  const outgoing = firstCount(
+    await readQueryRows(
+      await targetConn.query(
+        `MATCH (f:Folder)-[r:${REL_TABLE_NAME}]->() ` +
+          `WHERE f.filePath = '${escaped}' AND r.type <> 'CONTAINS' RETURN count(r) AS cnt`,
+      ),
+    ),
+  );
+  const incoming = firstCount(
+    await readQueryRows(
+      await targetConn.query(
+        `MATCH ()-[r:${REL_TABLE_NAME}]->(f:Folder) ` +
+          `WHERE f.filePath = '${escaped}' AND r.type <> 'CONTAINS' RETURN count(r) AS cnt`,
+      ),
+    ),
+  );
+  return outgoing + incoming;
+};
+
+const pruneEmptyFolderAncestorsForFile = async (
+  targetConn: lbug.Connection,
+  filePath: string,
+): Promise<number> => {
+  let deletedFolders = 0;
+  for (const folderPath of folderAncestorsDeepestFirst(filePath)) {
+    try {
+      const childCount = await countFolderChildren(targetConn, folderPath);
+      if (childCount > 0) break;
+      const nonContainsCount = await countFolderNonContainsRelationships(targetConn, folderPath);
+      if (nonContainsCount > 0) break;
+      await queryAndDrain(
+        targetConn,
+        `MATCH (f:Folder) WHERE f.filePath = '${escapeCypherString(folderPath)}' DETACH DELETE f`,
+      );
+      deletedFolders++;
+    } catch {
+      break;
+    }
+  }
+  return deletedFolders;
+};
+
 /**
  * Delete all nodes (and their relationships) for a specific file from LadybugDB
  * @param filePath - The file path to delete nodes for
@@ -1427,7 +1500,8 @@ export const deleteNodesForFile = async (
 
   try {
     let deletedNodes = 0;
-    const escapedPath = filePath.replace(/'/g, "''");
+    const normalizedFilePath = normalizeGraphPath(filePath);
+    const escapedPath = escapeCypherString(normalizedFilePath);
 
     // Delete nodes from each table that has filePath
     // DETACH DELETE removes the node and all its relationships
@@ -1467,6 +1541,8 @@ export const deleteNodesForFile = async (
       // Embedding table may not exist or nodeId format may differ
     }
 
+    deletedNodes += await pruneEmptyFolderAncestorsForFile(targetConn!, normalizedFilePath);
+
     return { deletedNodes };
   } finally {
     // Close per-query connection if used
@@ -1503,8 +1579,7 @@ export const queryImporters = async (targetFilePath: string): Promise<string[]> 
   `;
   try {
     const queryResult = await conn.query(cypher);
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
+    const rows = await readQueryRows(queryResult);
     const out: string[] = [];
     for (const row of rows) {
       const v = (row as { importer?: unknown }).importer;
@@ -1533,11 +1608,10 @@ export const deleteAllCommunitiesAndProcesses = async (): Promise<{
   for (const label of ['Community', 'Process']) {
     try {
       const countResult = await conn.query(`MATCH (n:${label}) RETURN count(n) AS cnt`);
-      const result = Array.isArray(countResult) ? countResult[0] : countResult;
-      const rows = await result.getAll();
+      const rows = await readQueryRows(countResult);
       const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
       if (count > 0) {
-        await conn.query(`MATCH (n:${label}) DETACH DELETE n`);
+        await queryAndDrain(conn, `MATCH (n:${label}) DETACH DELETE n`);
         nodesDeleted += count;
       }
     } catch {

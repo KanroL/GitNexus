@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { access, mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import { access, mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
@@ -117,6 +117,35 @@ async function countFunctionsNamed(repoPath: string, name: string): Promise<numb
     `MATCH (n:Function) WHERE n.name = '${name}' RETURN count(n) AS cnt`,
   );
   return Number(rows[0]?.cnt ?? 0);
+}
+
+async function structureTopology(repoPath: string): Promise<{
+  folderPaths: string[];
+  containsPairs: string[];
+}> {
+  const folderRows = await queryRepo<{ filePath: string }>(
+    repoPath,
+    `MATCH (f:Folder) RETURN f.filePath AS filePath`,
+  );
+  const folderToFolderRows = await queryRepo<{ source: string; target: string }>(
+    repoPath,
+    `MATCH (a:Folder)-[r:CodeRelation]->(b:Folder)
+     WHERE r.type = 'CONTAINS'
+     RETURN a.filePath AS source, b.filePath AS target`,
+  );
+  const folderToFileRows = await queryRepo<{ source: string; target: string }>(
+    repoPath,
+    `MATCH (a:Folder)-[r:CodeRelation]->(b:File)
+     WHERE r.type = 'CONTAINS'
+     RETURN a.filePath AS source, b.filePath AS target`,
+  );
+
+  return {
+    folderPaths: folderRows.map((row) => row.filePath).sort(),
+    containsPairs: [...folderToFolderRows, ...folderToFileRows]
+      .map((row) => `${row.source}->${row.target}`)
+      .sort(),
+  };
 }
 
 async function assertIncrementalMatchesForce(repoPath: string) {
@@ -574,6 +603,95 @@ export function useValue(): string {
       await repo.cleanup();
     }
   }, 600_000);
+
+  describe('incremental structure topology', () => {
+    it('adds Folder nodes and CONTAINS relationships for a file in a brand-new nested directory', async () => {
+      const repo = await setupRepo();
+      try {
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+        await mkdir(path.join(repo.dbPath, 'src', 'new', 'nested'), { recursive: true });
+        await writeFile(
+          path.join(repo.dbPath, 'src', 'new', 'nested', 'added.ts'),
+          'export function added(): number { return 1; }\n',
+        );
+
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+        const topology = await structureTopology(repo.dbPath);
+
+        expect(topology.folderPaths).toEqual(expect.arrayContaining(['src/new', 'src/new/nested']));
+        expect(topology.containsPairs).toEqual(
+          expect.arrayContaining([
+            'src->src/new',
+            'src/new->src/new/nested',
+            'src/new/nested->src/new/nested/added.ts',
+          ]),
+        );
+      } finally {
+        await closeLbug();
+        await repo.cleanup();
+      }
+    }, 600_000);
+
+    it('removes stale Folder and CONTAINS topology after deleting the last file in a directory', async () => {
+      const repo = await setupRepo();
+      try {
+        await mkdir(path.join(repo.dbPath, 'src', 'obsolete'), { recursive: true });
+        await writeFile(
+          path.join(repo.dbPath, 'src', 'obsolete', 'only.ts'),
+          'export function only(): number { return 1; }\n',
+        );
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+
+        await rm(path.join(repo.dbPath, 'src', 'obsolete', 'only.ts'));
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+        const topology = await structureTopology(repo.dbPath);
+
+        expect(await countNodesForPath(repo.dbPath, 'src/obsolete/only.ts')).toBe(0);
+        expect(topology.folderPaths).not.toContain('src/obsolete');
+        expect(topology.containsPairs.some((pair) => pair.includes('src/obsolete'))).toBe(false);
+      } finally {
+        await closeLbug();
+        await repo.cleanup();
+      }
+    }, 600_000);
+
+    it('updates Folder and CONTAINS topology after moving a file to a new nested directory', async () => {
+      const repo = await setupRepo();
+      try {
+        await mkdir(path.join(repo.dbPath, 'src', 'old'), { recursive: true });
+        await writeFile(
+          path.join(repo.dbPath, 'src', 'old', 'only.ts'),
+          'export function only(): number { return 1; }\n',
+        );
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+
+        await mkdir(path.join(repo.dbPath, 'src', 'moved', 'nested'), { recursive: true });
+        await rename(
+          path.join(repo.dbPath, 'src', 'old', 'only.ts'),
+          path.join(repo.dbPath, 'src', 'moved', 'nested', 'renamed.ts'),
+        );
+        await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+        const topology = await structureTopology(repo.dbPath);
+
+        expect(await countNodesForPath(repo.dbPath, 'src/old/only.ts')).toBe(0);
+        expect(topology.folderPaths).not.toContain('src/old');
+        expect(topology.containsPairs.some((pair) => pair.includes('src/old'))).toBe(false);
+        expect(topology.folderPaths).toEqual(
+          expect.arrayContaining(['src/moved', 'src/moved/nested']),
+        );
+        expect(topology.containsPairs).toEqual(
+          expect.arrayContaining([
+            'src->src/moved',
+            'src/moved->src/moved/nested',
+            'src/moved/nested->src/moved/nested/renamed.ts',
+          ]),
+        );
+      } finally {
+        await closeLbug();
+        await repo.cleanup();
+      }
+    }, 600_000);
+  });
 
   it('dependency export changes invalidate importers and remove stale provider symbols', async () => {
     const repo = await setupRepo();

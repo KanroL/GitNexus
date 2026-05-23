@@ -48,6 +48,25 @@ const collectGraphFilePaths = (graph: KnowledgeGraph): Set<string> => {
   return out;
 };
 
+const collectGraphFolderPaths = (graph: KnowledgeGraph): Set<string> => {
+  const out = new Set<string>();
+  graph.forEachNode((node) => {
+    if (node.label !== 'Folder') return;
+    const filePath = node.properties?.filePath;
+    if (typeof filePath === 'string' && filePath.length > 0) out.add(filePath);
+  });
+  return out;
+};
+
+const collectFolderAncestors = (filePath: string): string[] => {
+  const parts = filePath.replace(/\\/g, '/').split('/').filter(Boolean);
+  const ancestors: string[] = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    ancestors.push(parts.slice(0, i + 1).join('/'));
+  }
+  return ancestors;
+};
+
 const hasHashForPath = (
   hashes: ReadonlyMap<string, string> | Readonly<Record<string, string>>,
   filePath: string,
@@ -84,6 +103,28 @@ export const validateIncrementalGraphConsistency = async ({
         return {
           ok: false,
           reason: `deleted file ${deleted} still has ${count} ${label} node(s)`,
+        };
+      }
+    }
+  }
+
+  const graphFolderPaths = collectGraphFolderPaths(fullGraph);
+  for (const deleted of deletedFiles) {
+    for (const folderPath of collectFolderAncestors(deleted)) {
+      if (graphFolderPaths.has(folderPath)) continue;
+      let count: number;
+      try {
+        count = await operations.countNodesForFile('Folder', folderPath);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `deleted-folder node count query failed for ${folderPath}: ${failureMessage(err)}`,
+        };
+      }
+      if (count > 0) {
+        return {
+          ok: false,
+          reason: `deleted file ${deleted} left stale Folder node ${folderPath}`,
         };
       }
     }

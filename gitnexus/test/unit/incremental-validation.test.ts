@@ -113,6 +113,26 @@ describe('validateIncrementalGraphConsistency', () => {
     });
   });
 
+  it('fails when deleted-file folder topology remains after the folder is gone from the fresh graph', async () => {
+    const result = await validateIncrementalGraphConsistency({
+      deletedFiles: ['src/obsolete/only.ts'],
+      effectiveWriteSet: new Set(),
+      fullGraph: makeGraph(['src/keep.ts'], { Community: 0, Process: 0 }),
+      finalFileHashes: new Map([['src/keep.ts', 'hash-keep']]),
+      operations: makeOps({
+        countNodesForFile: async (label, filePath) =>
+          label === 'Folder' && filePath === 'src/obsolete' ? 1 : 0,
+        countGraphWideNodes: async () => 0,
+      }),
+      fileBoundNodeLabels: ['File'],
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      reason: 'deleted file src/obsolete/only.ts left stale Folder node src/obsolete',
+    });
+  });
+
   it('fails when the relationship count query fails', async () => {
     const result = await validateIncrementalGraphConsistency({
       deletedFiles: [],

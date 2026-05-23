@@ -93,6 +93,29 @@ describe('extractChangedSubgraph', () => {
     expect(sub.nodes).toEqual([]);
     expect(sub.relationships).toEqual([]);
   });
+
+  it('structure topology: includes folder ancestors for a newly added nested file', () => {
+    const g = createKnowledgeGraph();
+    g.addNode(makeFileNode('Folder:src', 'src', 'Folder'));
+    g.addNode(makeFileNode('Folder:src/new', 'src/new', 'Folder'));
+    g.addNode(makeFileNode('Folder:src/new/nested', 'src/new/nested', 'Folder'));
+    g.addNode(makeFileNode('File:src/new/nested/added.ts', 'src/new/nested/added.ts', 'File'));
+    g.addRelationship(makeRel('c1', 'Folder:src', 'Folder:src/new', 'CONTAINS'));
+    g.addRelationship(makeRel('c2', 'Folder:src/new', 'Folder:src/new/nested', 'CONTAINS'));
+    g.addRelationship(
+      makeRel('c3', 'Folder:src/new/nested', 'File:src/new/nested/added.ts', 'CONTAINS'),
+    );
+
+    const sub = extractChangedSubgraph(g, new Set(['src/new/nested/added.ts']));
+
+    expect(sub.nodes.map((n) => n.id).sort()).toEqual([
+      'File:src/new/nested/added.ts',
+      'Folder:src',
+      'Folder:src/new',
+      'Folder:src/new/nested',
+    ]);
+    expect(sub.relationships.map((r) => r.id).sort()).toEqual(['c1', 'c2', 'c3']);
+  });
 });
 
 describe('computeEffectiveWriteSet (Finding 1)', () => {

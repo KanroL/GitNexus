@@ -66,6 +66,7 @@ import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { EMBEDDING_TABLE_NAME, REL_TABLE_NAME } from './lbug/schema.js';
 import { STALE_HASH_SENTINEL } from './lbug/schema.js';
+import { acquireDbWriteLock } from './lbug/access-guard.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -616,6 +617,8 @@ export async function runFullAnalysis(
     };
   }
 
+  const dbWriteGuard = await acquireDbWriteLock(lbugPath);
+  try {
   // We load caches only after the no-change incremental fast path. A no-op
   // analyze should not pay for parse-cache JSON reads or embedding preservation.
   if (shouldLoadCache && existingMeta) {
@@ -1469,5 +1472,8 @@ export async function runFullAnalysis(
       /* swallow */
     }
     throw err;
+  }
+  } finally {
+    await dbWriteGuard.release();
   }
 }

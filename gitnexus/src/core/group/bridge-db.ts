@@ -182,7 +182,7 @@ export async function ensureBridgeSchema(handle: BridgeHandle): Promise<void> {
   const conn = handle._conn as lbug.Connection;
   for (const q of BRIDGE_SCHEMA_QUERIES) {
     try {
-      await conn.query(q);
+      await drainQueryResult(await conn.query(q));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes(LBUG_ALREADY_EXISTS_MSG)) throw err;
@@ -203,31 +203,60 @@ export async function queryBridge<T>(
       throw new Error(`Bridge query prepare failed: ${errMsg}`);
     }
     const queryResult = await conn.execute(stmt, params);
-    const result = unwrapQueryResult(queryResult);
-    return (await result.getAll()) as T[];
+    return (await readQueryRows(queryResult)) as T[];
   }
   const queryResult = await conn.query(cypher);
-  const result = unwrapQueryResult(queryResult);
-  return (await result.getAll()) as T[];
+  return (await readQueryRows(queryResult)) as T[];
 }
 
-/**
- * LadybugDB's `conn.query` / `conn.execute` can return either a single
- * `QueryResult` (for a single statement) or an array of them (when a
- * multi-statement script is dispatched). We always pass a single statement,
- * so the array form is a wrapper we unwrap here — but an empty top-level
- * array would cause `.getAll()` on `undefined` and crash with a confusing
- * stack. Throwing an explicit error makes a driver-contract regression
- * visible immediately instead of masking it.
- */
-function unwrapQueryResult(queryResult: lbug.QueryResult | lbug.QueryResult[]): lbug.QueryResult {
-  if (Array.isArray(queryResult)) {
-    if (queryResult.length === 0) {
-      throw new Error('Bridge query returned an empty QueryResult array');
-    }
-    return queryResult[0];
+async function closeQueryResult(result: lbug.QueryResult): Promise<void> {
+  try {
+    await result.close();
+  } catch {
+    /* best-effort */
   }
-  return queryResult;
+}
+
+async function drainQueryResult(queryResult: lbug.QueryResult | lbug.QueryResult[]): Promise<void> {
+  const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+  let firstError: unknown;
+  let hasError = false;
+  for (const result of results) {
+    try {
+      await result.getAll();
+    } catch (err) {
+      if (!hasError) {
+        firstError = err;
+        hasError = true;
+      }
+    } finally {
+      await closeQueryResult(result);
+    }
+  }
+  if (hasError) throw firstError;
+}
+
+async function readQueryRows(queryResult: lbug.QueryResult | lbug.QueryResult[]): Promise<any[]> {
+  const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+  let rows: any[] = [];
+  let firstError: unknown;
+  let hasError = false;
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    try {
+      const resultRows = await result.getAll();
+      if (i === 0) rows = resultRows;
+    } catch (err) {
+      if (!hasError) {
+        firstError = err;
+        hasError = true;
+      }
+    } finally {
+      await closeQueryResult(result);
+    }
+  }
+  if (hasError) throw firstError;
+  return rows;
 }
 
 export async function closeBridgeDb(handle: BridgeHandle): Promise<void> {
@@ -238,7 +267,7 @@ export async function closeBridgeDb(handle: BridgeHandle): Promise<void> {
   // with the WAL replay or trip the database-id check on the sidecars.
   // CHECKPOINT is a no-op when there's nothing pending, so it's cheap.
   try {
-    await (handle._conn as lbug.Connection).query('CHECKPOINT');
+    await drainQueryResult(await (handle._conn as lbug.Connection).query('CHECKPOINT'));
   } catch {
     /* ignore — older LadybugDB or schemaless DB may not accept it */
   }

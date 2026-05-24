@@ -26,6 +26,7 @@ import {
   type LbugConnectionHandle,
 } from './lbug-config.js';
 import { isVectorExtensionSupportedByPlatform } from '../platform/capabilities.js';
+import { acquireDbReadLock, type DbAccessGuard } from './access-guard.js';
 
 import { logger } from '../logger.js';
 // ---------------------------------------------------------------------------
@@ -449,7 +450,9 @@ export const initLbug = async (dbPath: string) => {
 export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>): Promise<T> => {
   let lastError: unknown;
   for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
+    let readGuard: DbAccessGuard | undefined;
     try {
+      readGuard = await acquireDbReadLock(dbPath);
       return await runWithSessionLock(async () => {
         await ensureLbugInitialized(dbPath);
         try {
@@ -482,6 +485,8 @@ export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>)
       });
       // Sleep outside the lock — no need to block others while waiting
       await new Promise((resolve) => setTimeout(resolve, DB_LOCK_RETRY_DELAY_MS * attempt));
+    } finally {
+      await readGuard?.release();
     }
   }
   // This line is unreachable — the loop either returns or throws inside,

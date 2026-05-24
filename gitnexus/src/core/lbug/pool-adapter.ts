@@ -19,6 +19,7 @@ import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
 import { loadFTSExtension } from './lbug-adapter.js';
 import { createLbugDatabase, isWalCorruptionError } from './lbug-config.js';
+import { acquireDbReadLock, type DbAccessGuard } from './access-guard.js';
 
 /** Per-repo pool: one Database, many Connections */
 interface PoolEntry {
@@ -33,6 +34,10 @@ interface PoolEntry {
   dbPath: string;
   /** Set to true when the pool entry is closed — checkin will close orphaned connections */
   closed: boolean;
+  /** Cross-process read marker held while this pool keeps the DB open. */
+  readLock?: DbAccessGuard;
+  /** Native Database close promise, used to delay read-lock release until close settles. */
+  closePromise?: Promise<void>;
 }
 
 const pool = new Map<string, PoolEntry>();
@@ -161,6 +166,10 @@ function closeOne(repoId: string): void {
   if (!entry) return;
 
   entry.closed = true;
+  const releaseReadLock = () => {
+    entry.readLock?.release().catch(() => {});
+    entry.readLock = undefined;
+  };
 
   // Close available connections — fire-and-forget with .catch() to prevent
   // unhandled rejections.  Native close() returns Promise<void> but can crash
@@ -188,10 +197,17 @@ function closeOne(repoId: string): void {
         shared.refCount = 0;
         shared.ftsLoaded = false;
       } else {
-        shared.db.close().catch(() => {});
+        entry.closePromise = shared.db.close().catch(() => {});
+        entry.closePromise.finally(() => {
+          if (entry.checkedOut === 0) releaseReadLock();
+        }).catch(() => {});
         dbCache.delete(entry.dbPath);
       }
     }
+  }
+
+  if (entry.checkedOut === 0 && !entry.closePromise) {
+    releaseReadLock();
   }
 
   pool.delete(repoId);
@@ -348,6 +364,8 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     throw new Error(`LadybugDB not found at ${dbPath}. Run: gitnexus analyze`);
   }
 
+  const readLock = await acquireDbReadLock(dbPath);
+  try {
   evictLRU();
 
   // Reuse an existing native Database if another repoId already opened this path.
@@ -444,8 +462,13 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     lastUsed: Date.now(),
     dbPath,
     closed: false,
+    readLock,
   });
   ensureIdleTimer();
+  } catch (err) {
+    await readLock.release();
+    throw err;
+  }
 }
 
 /**
@@ -569,6 +592,20 @@ function checkin(entry: PoolEntry, conn: lbug.Connection): void {
   if (entry.closed) {
     // Pool entry was deleted during checkout — close the orphaned connection
     conn.close().catch(() => {});
+    entry.checkedOut = Math.max(0, entry.checkedOut - 1);
+    if (entry.checkedOut === 0) {
+      entry.closePromise
+        ?.catch(() => {})
+        .finally(() => {
+          entry.readLock?.release().catch(() => {});
+          entry.readLock = undefined;
+        })
+        .catch(() => {});
+      if (!entry.closePromise) {
+        entry.readLock?.release().catch(() => {});
+        entry.readLock = undefined;
+      }
+    }
     return;
   }
   if (entry.waiters.length > 0) {
@@ -594,6 +631,41 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+const closeQueryResult = async (result: lbug.QueryResult): Promise<void> => {
+  try {
+    await result.close();
+  } catch {
+    // Best-effort cleanup only.
+  }
+};
+
+const readQueryRows = async (
+  queryResult: lbug.QueryResult | lbug.QueryResult[],
+): Promise<any[]> => {
+  const results = Array.isArray(queryResult) ? queryResult : [queryResult];
+  let rows: any[] = [];
+  let firstError: unknown;
+  let hasError = false;
+
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    try {
+      const resultRows = await result.getAll();
+      if (i === 0) rows = resultRows;
+    } catch (err) {
+      if (!hasError) {
+        firstError = err;
+        hasError = true;
+      }
+    } finally {
+      await closeQueryResult(result);
+    }
+  }
+
+  if (hasError) throw firstError;
+  return rows;
+};
+
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
   const entry = pool.get(repoId);
   if (!entry) {
@@ -611,9 +683,7 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
   activeQueryCount++;
   try {
     const queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    return rows;
+    return await readQueryRows(queryResult);
   } finally {
     activeQueryCount--;
     restoreStdout();
@@ -647,9 +717,7 @@ export const executeParameterized = async (
       throw new Error(`Prepare failed: ${errMsg}`);
     }
     const queryResult = await withTimeout(conn.execute(stmt, params), QUERY_TIMEOUT_MS, 'Execute');
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    return rows;
+    return await readQueryRows(queryResult);
   } finally {
     activeQueryCount--;
     restoreStdout();

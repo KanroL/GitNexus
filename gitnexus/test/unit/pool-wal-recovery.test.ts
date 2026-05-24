@@ -13,8 +13,12 @@ const { stderrWriteMock } = vi.hoisted(() => ({
 vi.mock('fs/promises', () => ({
   default: {
     stat: vi.fn().mockResolvedValue({}),
+    mkdir: vi.fn().mockResolvedValue(undefined),
+    readFile: vi.fn().mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' })),
+    readdir: vi.fn().mockResolvedValue([]),
     unlink: vi.fn().mockResolvedValue(undefined),
     rename: vi.fn().mockResolvedValue(undefined),
+    writeFile: vi.fn().mockResolvedValue(undefined),
   },
 }));
 

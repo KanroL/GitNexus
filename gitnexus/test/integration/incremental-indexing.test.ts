@@ -80,6 +80,57 @@ async function setupWorkerArtifactRepo() {
   return repo;
 }
 
+async function setupProcessRepo() {
+  const repo = await createTempDir('gitnexus-process-preserve-int-');
+  const src = path.join(repo.dbPath, 'src');
+  await mkdir(src, { recursive: true });
+  await writeFile(
+    path.join(src, 'a.ts'),
+    `import { b } from './b';
+
+export function a(): string {
+  return b();
+}
+`,
+  );
+  await writeFile(
+    path.join(src, 'b.ts'),
+    `import { c } from './c';
+
+export function b(): string {
+  return c();
+}
+`,
+  );
+  await writeFile(
+    path.join(src, 'c.ts'),
+    `import { d } from './d';
+
+export function c(): string {
+  return d();
+}
+`,
+  );
+  await writeFile(
+    path.join(src, 'd.ts'),
+    `export function d(): string {
+  return 'processoldterm';
+}
+`,
+  );
+  await writeFile(path.join(repo.dbPath, 'package.json'), '{"name":"process-preserve-fixture"}\n');
+  execSync('git init', { cwd: repo.dbPath, stdio: 'pipe' });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m initial', {
+    cwd: repo.dbPath,
+    stdio: 'pipe',
+  });
+  return repo;
+}
+
 async function setupCrossFileRelationshipRepo() {
   const repo = await createTempDir('gitnexus-cross-file-rel-int-');
   const src = path.join(repo.dbPath, 'src');
@@ -337,6 +388,72 @@ async function crossFileRelationshipTopology(repoPath: string): Promise<{
   return {
     imports: rows.filter((row) => row.type === 'IMPORTS').map(serialize).sort(),
     calls: rows.filter((row) => row.type === 'CALLS').map(serialize).sort(),
+  };
+}
+
+async function communityProcessTopology(repoPath: string): Promise<{
+  communities: string[];
+  processes: string[];
+  memberships: string[];
+  steps: string[];
+}> {
+  const communityRows = await queryRepo<{
+    id: string;
+    label: string;
+    heuristicLabel: string;
+    symbolCount: number;
+  }>(
+    repoPath,
+    `MATCH (c:Community)
+     RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.symbolCount AS symbolCount`,
+  );
+  const processRows = await queryRepo<{
+    id: string;
+    label: string;
+    heuristicLabel: string;
+    processType: string;
+    stepCount: number;
+  }>(
+    repoPath,
+    `MATCH (p:Process)
+     RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel,
+            p.processType AS processType, p.stepCount AS stepCount`,
+  );
+  const membershipRows = await queryRepo<{
+    sourceId: string;
+    targetId: string;
+    type: string;
+  }>(
+    repoPath,
+    `MATCH (n)-[r:CodeRelation]->(c:Community)
+     WHERE r.type = 'MEMBER_OF'
+     RETURN n.id AS sourceId, c.id AS targetId, r.type AS type`,
+  );
+  const stepRows = await queryRepo<{
+    sourceId: string;
+    targetId: string;
+    type: string;
+    step: number;
+  }>(
+    repoPath,
+    `MATCH (n)-[r:CodeRelation]->(p:Process)
+     WHERE r.type = 'STEP_IN_PROCESS'
+     RETURN n.id AS sourceId, p.id AS targetId, r.type AS type, r.step AS step`,
+  );
+
+  return {
+    communities: communityRows
+      .map((row) => `${row.id}|${row.label}|${row.heuristicLabel}|${row.symbolCount}`)
+      .sort(),
+    processes: processRows
+      .map((row) => `${row.id}|${row.label}|${row.heuristicLabel}|${row.processType}|${row.stepCount}`)
+      .sort(),
+    memberships: membershipRows
+      .map((row) => `${row.type}:${row.sourceId}->${row.targetId}`)
+      .sort(),
+    steps: stepRows
+      .map((row) => `${row.type}:${row.sourceId}->${row.targetId}:${row.step}`)
+      .sort(),
   };
 }
 
@@ -740,6 +857,11 @@ export function useValue(): string {
       const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks(logs));
       expect(incremental.pipelineResult).toBeUndefined();
       expect(logs.some((line) => line.includes('Incremental body-only fast path'))).toBe(true);
+      expect(
+        logs.some((line) =>
+          line.includes('Incremental community/process unchanged: semantic surface unchanged'),
+        ),
+      ).toBe(true);
 
       const overlays = await loadFreshBodyOnlyContentOverlays(getStoragePaths(repo.dbPath).storagePath);
       expect(overlays.get('src/provider.ts')?.content).toContain('bodyfastnewterm');
@@ -758,11 +880,44 @@ export function useValue(): string {
       expect(incrementalSearch).toEqual(
         await searchFreshnessSnapshot(repo.dbPath, ['bodyfastwarmterm', 'bodyfastnewterm']),
       );
+      expect((await loadFreshBodyOnlyContentOverlays(getStoragePaths(repo.dbPath).storagePath)).size).toBe(0);
       expect(beforeStructure).toEqual(await persistentStructureTopology(repo.dbPath));
       expect(beforeRelationships).toEqual(await crossFileRelationshipTopology(repo.dbPath));
     } finally {
       if (previousVerbose === undefined) delete process.env.GITNEXUS_VERBOSE;
       else process.env.GITNEXUS_VERBOSE = previousVerbose;
+      await closeLbug();
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('body-only edit preserves community and process rows without recompute', async () => {
+    const repo = await setupProcessRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      const before = await communityProcessTopology(repo.dbPath);
+      expect(before.communities.length).toBeGreaterThan(0);
+      expect(before.processes.length).toBeGreaterThan(0);
+      expect(before.steps.length).toBeGreaterThan(0);
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'd.ts'),
+        `export function d(): string {
+  return 'processnewterm';
+}
+`,
+      );
+      const logs: string[] = [];
+      const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks(logs));
+      expect(incremental.pipelineResult).toBeUndefined();
+      expect(logs.some((line) => line.includes('Incremental body-only fast path'))).toBe(true);
+      expect(
+        logs.some((line) =>
+          line.includes('Incremental community/process unchanged: semantic surface unchanged'),
+        ),
+      ).toBe(true);
+      expect(await communityProcessTopology(repo.dbPath)).toEqual(before);
+    } finally {
       await closeLbug();
       await repo.cleanup();
     }
@@ -825,6 +980,47 @@ export function useValue(): string {
     }
   }, 600_000);
 
+  it('pending body-only overlay falls back before a separate non-body incremental change', async () => {
+    const repo = await setupRepo();
+    try {
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'provider.ts'),
+        `export function value(): string {
+  return 'pendingoverlaynewterm';
+}
+`,
+      );
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      let overlays = await loadFreshBodyOnlyContentOverlays(getStoragePaths(repo.dbPath).storagePath);
+      expect(overlays.get('src/provider.ts')?.content).toContain('pendingoverlaynewterm');
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'extra.ts'),
+        `export function renamedExtra(): number {
+  return 2;
+}
+`,
+      );
+      const logs: string[] = [];
+      const materialized = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks(logs));
+      expect(materialized.pipelineResult).toBeDefined();
+      expect(
+        logs.some((line) =>
+          line.includes('Incremental fallback: pending body-only content overlays require materialization'),
+        ),
+      ).toBe(true);
+      overlays = await loadFreshBodyOnlyContentOverlays(getStoragePaths(repo.dbPath).storagePath);
+      expect(overlays.size).toBe(0);
+
+      const search = await searchFreshnessSnapshot(repo.dbPath, ['pendingoverlaynewterm']);
+      expect(search.pendingoverlaynewterm.filePaths).toContain('src/provider.ts');
+    } finally {
+      await closeLbug();
+      await repo.cleanup();
+    }
+  }, 600_000);
+
   it('import/export rename misses cached scope finalize output', async () => {
     const repo = await setupRepo();
     const workerOptions = {
@@ -853,6 +1049,11 @@ export function useValue(): string {
       const logs: string[] = [];
       const renamed = await runFullAnalysis(repo.dbPath, workerOptions, callbacks(logs));
       expect(logs.some((line) => line.includes('Incremental body-only fast path'))).toBe(false);
+      expect(
+        logs.some((line) =>
+          line.includes('Incremental community/process recompute: global fallback'),
+        ),
+      ).toBe(true);
       expect(renamed.pipelineResult?.scopeStats.finalizeCacheHits ?? 0).toBe(0);
       expect(renamed.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
       expect(renamed.pipelineResult?.scopeStats.partialEnabled).toBe(false);

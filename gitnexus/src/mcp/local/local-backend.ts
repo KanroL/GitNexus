@@ -40,6 +40,10 @@ import {
   getExactScanLimit,
   isVectorExtensionSupportedByPlatform,
 } from '../../core/platform/capabilities.js';
+import {
+  loadFreshBodyOnlyContentOverlays,
+  overlayContentForNode,
+} from '../../core/incremental/body-only-state.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
 import { logger } from '../../core/logger.js';
@@ -874,6 +878,13 @@ export class LocalBackend {
           if (contentRows.length > 0) {
             content = contentRows[0].content ?? contentRows[0][0];
           }
+          content = await this.bodyOnlyOverlayContent(
+            repo,
+            sym.filePath,
+            sym.startLine,
+            sym.endLine,
+            content,
+          );
         } catch (e) {
           logQueryError('query:content-fetch', e);
         }
@@ -1087,6 +1098,22 @@ export class LocalBackend {
     }
 
     return { results, ftsUsed };
+  }
+
+  private async bodyOnlyOverlayContent(
+    repo: RepoHandle,
+    filePath: unknown,
+    startLine: unknown,
+    endLine: unknown,
+    fallback?: string,
+  ): Promise<string | undefined> {
+    if (typeof filePath !== 'string' || filePath.length === 0) return fallback;
+    try {
+      const overlays = await loadFreshBodyOnlyContentOverlays(repo.storagePath);
+      return overlayContentForNode(overlays.get(filePath), startLine, endLine) ?? fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   /**
@@ -1554,7 +1581,15 @@ export class LocalBackend {
       );
       if (rows.length === 0) return { kind: 'not_found' };
       const r = rows[0] as any;
-      const symbol = {
+      const symbol: {
+        id: string;
+        name: string;
+        type: string;
+        filePath: string;
+        startLine: number;
+        endLine: number;
+        content?: string;
+      } = {
         id: (r.id ?? r[0]) as string,
         name: (r.name ?? r[1]) as string,
         type: (r.type ?? r[2] ?? '') as string,
@@ -1563,6 +1598,15 @@ export class LocalBackend {
         endLine: (r.endLine ?? r[5]) as number,
         ...(include_content ? { content: (r.content ?? r[6]) as string | undefined } : {}),
       };
+      if (include_content) {
+        symbol.content = await this.bodyOnlyOverlayContent(
+          repo,
+          symbol.filePath,
+          symbol.startLine,
+          symbol.endLine,
+          symbol.content,
+        );
+      }
       // Same LadybugDB label-enrichment as the name-based path: a UID
       // pointing at a Class must still surface `type: 'Class'` so impact's
       // Class/Interface BFS seed fires. No-op when type is already set.
@@ -1604,6 +1648,17 @@ export class LocalBackend {
       endLine: (r.endLine ?? r[5]) as number,
       ...(include_content ? { content: (r.content ?? r[6]) as string | undefined } : {}),
     }));
+    if (include_content) {
+      for (const symbol of normalized) {
+        symbol.content = await this.bodyOnlyOverlayContent(
+          repo,
+          symbol.filePath,
+          symbol.startLine,
+          symbol.endLine,
+          symbol.content,
+        );
+      }
+    }
 
     // Enrich labels for any candidates where `labels(n)[0]` came back empty.
     // LadybugDB returns an empty string for that projection on certain node

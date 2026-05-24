@@ -595,6 +595,7 @@ const logBodyOnlyFastPathProfile = (
   log(
     `  semanticSurface: changedFiles=0, unchangedFiles=${details.semanticSurfaceUnchangedFiles}, importerExpansionSkipped=${details.changedFiles}, finalizeInvalidationReason=none`,
   );
+  log('  communities/processes: unchanged, recomputeSkipped=true, reason=semantic surface unchanged');
   log('  pipeline: total=0ms, scan=0ms, structure=0ms, parseExtract=0ms, crossFile=0ms, scopeResolution=0ms, communities=0ms, processes=0ms');
   log(
     `  db: writeback=${formatMs(profile.dbWritebackMs)}, init=${formatMs(profile.lbugInitMs)}, close=${formatMs(profile.finalCloseMs)}, dirtyMeta=${formatMs(profile.dirtyMetaMs)}, validation=${formatMs(profile.validationMs)}`,
@@ -746,6 +747,7 @@ const tryRunBodyOnlyFastPath = async (input: {
       `Incremental body-only fast path: changed=${changedFiles.length}, ` +
         'semantic surface unchanged; updating content overlay only',
     );
+    log('Incremental community/process unchanged: semantic surface unchanged; preserving existing Community/Process rows');
     progress('lbug', 60, 'Updating changed file content overlay...');
 
     const dirtyMetaStart = Date.now();
@@ -1284,6 +1286,11 @@ export async function runFullAnalysis(
       }
     }
 
+    log(
+      'Incremental community/process recompute: global fallback ' +
+        '(affected process/community recompute requires global fallback)',
+    );
+
     const importerExpansionStart = Date.now();
     try {
       const initStart = Date.now();
@@ -1393,8 +1400,12 @@ export async function runFullAnalysis(
   progress('lbug', 60, 'Loading into LadybugDB...');
 
   const dbWritebackStart = Date.now();
+  let pendingBodyOnlyOverlayPathsForWriteback: string[] = [];
 
   if (isIncremental && hashDiff) {
+    pendingBodyOnlyOverlayPathsForWriteback = [
+      ...(await loadFreshBodyOnlyContentOverlays(storagePath)).keys(),
+    ];
     log(
       `Incremental: changed=${hashDiff.changed.length}, ` +
         `added=${hashDiff.added.length}, ` +
@@ -1445,8 +1456,7 @@ export async function runFullAnalysis(
     let lbugMsgCount = 0;
     if (isIncremental && hashDiff) {
       const writeSetPlanningStart = Date.now();
-      const pendingBodyOnlyOverlays = await loadFreshBodyOnlyContentOverlays(storagePath);
-      const pendingOverlayPaths = [...pendingBodyOnlyOverlays.keys()];
+      const pendingOverlayPaths = pendingBodyOnlyOverlayPathsForWriteback;
       const overlaysAlreadyWritable = pendingOverlayPaths.every((filePath) =>
         hashDiff.toWrite.includes(filePath),
       );

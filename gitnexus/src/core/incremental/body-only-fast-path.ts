@@ -86,17 +86,17 @@ const stripCommentsAndStrings = (content: string): string => {
     }
     if (ch === "'") {
       state = 'single';
-      out += ' ';
+      out += '0';
       continue;
     }
     if (ch === '"') {
       state = 'double';
-      out += ' ';
+      out += '0';
       continue;
     }
     if (ch === '`') {
       state = 'template';
-      out += ' ';
+      out += '0';
       continue;
     }
 
@@ -116,9 +116,59 @@ export const callExpressionSignature = (content: string): string => {
     const normalized = raw.replace(/\s+/g, '').replace(/\?\./g, '.');
     const lastSegment = normalized.split('.').pop() ?? normalized;
     if (!normalized || CALL_KEYWORDS.has(lastSegment)) continue;
-    calls.push(normalized);
+    calls.push(`${normalized}/${callArgumentCount(stripped, re.lastIndex - 1)}`);
   }
   return calls.join('\n');
+};
+
+const callArgumentCount = (content: string, openParenIndex: number): number => {
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let count = 0;
+  let hasCurrentArgument = false;
+
+  for (let i = openParenIndex + 1; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '(') {
+      parenDepth++;
+      hasCurrentArgument = true;
+      continue;
+    }
+    if (ch === ')') {
+      if (parenDepth === 0) {
+        return hasCurrentArgument ? count + 1 : count;
+      }
+      parenDepth--;
+      continue;
+    }
+    if (ch === '{') {
+      braceDepth++;
+      hasCurrentArgument = true;
+      continue;
+    }
+    if (ch === '}') {
+      if (braceDepth > 0) braceDepth--;
+      continue;
+    }
+    if (ch === '[') {
+      bracketDepth++;
+      hasCurrentArgument = true;
+      continue;
+    }
+    if (ch === ']') {
+      if (bracketDepth > 0) bracketDepth--;
+      continue;
+    }
+    if (ch === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      if (hasCurrentArgument) count++;
+      hasCurrentArgument = false;
+      continue;
+    }
+    if (!/\s/.test(ch)) hasCurrentArgument = true;
+  }
+
+  return hasCurrentArgument ? count + 1 : count;
 };
 
 export const bodyOnlyContentGuardReason = (

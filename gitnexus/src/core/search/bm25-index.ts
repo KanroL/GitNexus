@@ -2,10 +2,15 @@
  * Full-Text Search via LadybugDB FTS
  *
  * Uses LadybugDB's built-in full-text search indexes for keyword-based search.
- * Always reads from the database (no cached state to drift).
+ * Reads from LadybugDB FTS and overlays body-only content deltas that have
+ * not needed DB materialization yet.
  */
 
-import { queryFTS } from '../lbug/lbug-adapter.js';
+import { executeQuery as executeLbugQuery, queryFTS } from '../lbug/lbug-adapter.js';
+import {
+  contentMatchesSearchQuery,
+  loadFreshBodyOnlyContentOverlays,
+} from '../incremental/body-only-state.js';
 import { FTS_INDEXES } from './fts-schema.js';
 
 export interface BM25SearchResult {
@@ -19,6 +24,10 @@ export interface FTSSearchResponse {
   results: BM25SearchResult[];
   /** True when at least one FTS index query succeeded (index exists). */
   ftsAvailable: boolean;
+}
+
+export interface FTSSearchOptions {
+  storagePath?: string;
 }
 
 /**
@@ -57,6 +66,32 @@ async function queryFTSViaExecutor(
   }
 }
 
+const escapeCypherString = (value: string): string =>
+  value.replace(/\\/g, '\\\\').replace(/'/g, "''");
+
+const queryOverlayNodeIds = async (
+  executor: (cypher: string) => Promise<any[]>,
+  filePath: string,
+): Promise<string[]> => {
+  const escaped = escapeCypherString(filePath);
+  const nodeIds: string[] = [];
+  for (const { table } of FTS_INDEXES) {
+    const safeTable = `\`${table.replace(/`/g, '``')}\``;
+    try {
+      const rows = await executor(
+        `MATCH (n:${safeTable}) WHERE n.filePath = '${escaped}' RETURN n.id AS id`,
+      );
+      for (const row of rows) {
+        const id = row.id ?? row[0];
+        if (typeof id === 'string') nodeIds.push(id);
+      }
+    } catch {
+      // Some schemas may not have every indexed table yet.
+    }
+  }
+  return nodeIds.sort();
+};
+
 /**
  * Search using LadybugDB's built-in FTS (always fresh, reads from disk)
  *
@@ -72,9 +107,11 @@ export const searchFTSFromLbug = async (
   query: string,
   limit: number = 20,
   repoId?: string,
+  options: FTSSearchOptions = {},
 ): Promise<FTSSearchResponse> => {
   const resultsByIndex: any[][] = [];
   let queriesSucceeded = 0;
+  let overlayExecutor: ((cypher: string) => Promise<any[]>) | undefined;
 
   if (repoId) {
     // Use MCP connection pool via dynamic import
@@ -83,6 +120,7 @@ export const searchFTSFromLbug = async (
     const poolMod = await import('../lbug/pool-adapter.js');
     const { executeQuery } = poolMod;
     const executor = (cypher: string) => executeQuery(repoId, cypher);
+    overlayExecutor = executor;
 
     for (const { table, indexName } of FTS_INDEXES) {
       const result = await queryFTSViaExecutor(executor, table, indexName, query, limit);
@@ -92,6 +130,7 @@ export const searchFTSFromLbug = async (
       }
     }
   } else {
+    overlayExecutor = executeLbugQuery;
     // Use core lbug adapter (CLI / pipeline context) — also sequential for safety.
     for (const { table, indexName } of FTS_INDEXES) {
       try {
@@ -129,6 +168,29 @@ export const searchFTSFromLbug = async (
       score: top3.reduce((acc, e) => acc + e.score, 0),
       nodeIds: top3.map((e) => e.nodeId).filter((id) => id),
     });
+  }
+
+  if (options.storagePath) {
+    const overlays = await loadFreshBodyOnlyContentOverlays(options.storagePath);
+    for (const overlay of overlays.values()) {
+      if (contentMatchesSearchQuery(overlay.content, query)) {
+        const existing = merged.get(overlay.filePath);
+        const nodeIds = existing?.nodeIds?.length
+          ? existing.nodeIds
+          : overlayExecutor
+            ? await queryOverlayNodeIds(overlayExecutor, overlay.filePath)
+            : [];
+        merged.set(overlay.filePath, {
+          filePath: overlay.filePath,
+          score: Math.max(existing?.score ?? 0, 1),
+          nodeIds,
+        });
+      } else {
+        // The DB FTS index may still contain the previous body-only content.
+        // Suppress stale matches for files with a fresh overlay.
+        merged.delete(overlay.filePath);
+      }
+    }
   }
 
   // Sort by score descending and add rank

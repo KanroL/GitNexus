@@ -24,10 +24,6 @@ import {
   deleteNodesForFile,
   deleteAllCommunitiesAndProcesses,
   queryImporters,
-  updateBodyOnlyFileContents,
-  getLastLbugInitTimings,
-  getLastLbugCloseTimings,
-  initExistingLbugForBodyOnlyUpdate,
 } from './lbug/lbug-adapter.js';
 import { createSearchFTSIndexes } from './search/fts-indexes.js';
 import {
@@ -59,10 +55,18 @@ import { shadowCandidatesFor } from './incremental/shadow-candidates.js';
 import { validateIncrementalGraphConsistency } from './incremental/validation.js';
 import {
   BODY_ONLY_FAST_PATH_MAX_CHANGED_FILES,
+  DB_FILE_CONTENT_MAX_CHARS,
   bodyOnlyContentGuardReason,
+  callExpressionSignature,
   isBodyOnlyFastPathDisabled,
   isBodyOnlyFastPathLanguage,
 } from './incremental/body-only-fast-path.js';
+import {
+  loadBodyOnlyState,
+  loadFreshBodyOnlyContentOverlays,
+  saveMaterializedBodyOnlyStateFromRepo,
+  updateBodyOnlyOverlayState,
+} from './incremental/body-only-state.js';
 import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
   saveFileParseArtifactsBatch,
@@ -370,6 +374,126 @@ const computeChangedSemanticSurface = async (
 
 type SemanticSurfaceSummary = Awaited<ReturnType<typeof computeChangedSemanticSurface>>;
 
+const semanticSurfaceProviderForFile = (filePath: string) => {
+  const language = getLanguageFromFilename(filePath);
+  return language === SupportedLanguages.TypeScript
+    ? typescriptProvider
+    : language === SupportedLanguages.JavaScript
+      ? javascriptProvider
+      : undefined;
+};
+
+const normalizeRepoFilePath = (filePath: string): string => filePath.replace(/\\/g, '/');
+
+const loadIndexedBodyOnlyContents = async (
+  lbugPath: string,
+  filePaths: readonly string[],
+  profile?: {
+    lbugInitMs: number;
+    finalCloseMs: number;
+  },
+): Promise<Map<string, string> | null> => {
+  const normalizedFilePaths = filePaths.map(normalizeRepoFilePath);
+  const initStart = Date.now();
+  await initLbug(lbugPath);
+  if (profile) profile.lbugInitMs += Date.now() - initStart;
+
+  try {
+    const rows = await executePrepared(
+      'MATCH (n:File) WHERE n.filePath IN $filePaths RETURN n.filePath AS filePath, n.content AS content',
+      { filePaths: normalizedFilePaths },
+    );
+    const contents = new Map<string, string>();
+    const counts = new Map<string, number>();
+    for (const row of rows) {
+      const filePath = row.filePath ?? row[0];
+      const content = row.content ?? row[1];
+      if (typeof filePath !== 'string' || typeof content !== 'string') continue;
+      const normalized = normalizeRepoFilePath(filePath);
+      contents.set(normalized, content);
+      counts.set(normalized, (counts.get(normalized) ?? 0) + 1);
+    }
+    for (const filePath of normalizedFilePaths) {
+      if (counts.get(filePath) !== 1) return null;
+    }
+    return contents;
+  } finally {
+    const closeStart = Date.now();
+    await closeLbug();
+    if (profile) profile.finalCloseMs += Date.now() - closeStart;
+  }
+};
+
+const recoverBodyOnlySemanticSurfaceFromIndexedContent = async (input: {
+  repoPath: string;
+  lbugPath: string;
+  changedFiles: readonly string[];
+  profile: {
+    lbugInitMs: number;
+    finalCloseMs: number;
+  };
+  log?: (message: string) => void;
+}): Promise<
+  | {
+      recovered: true;
+      semanticSurface: SemanticSurfaceSummary;
+      previousIndexedContents: Map<string, string>;
+    }
+  | { recovered: false; reason: string }
+> => {
+  const { repoPath, lbugPath, changedFiles, profile, log } = input;
+  if (changedFiles.length === 0 || changedFiles.length > BODY_ONLY_FAST_PATH_MAX_CHANGED_FILES) {
+    return { recovered: false, reason: 'changed file count is outside body-only cache recovery limits' };
+  }
+  const unsupported = changedFiles.find((filePath) => !isBodyOnlyFastPathLanguage(filePath));
+  if (unsupported) return { recovered: false, reason: `unsupported language for ${unsupported}` };
+
+  let previousIndexedContents: Map<string, string> | null;
+  try {
+    previousIndexedContents = await loadIndexedBodyOnlyContents(lbugPath, changedFiles, profile);
+  } catch (err) {
+    return { recovered: false, reason: `could not read indexed file content: ${(err as Error).message}` };
+  }
+  if (!previousIndexedContents) {
+    return { recovered: false, reason: 'indexed File content rows were missing or duplicated' };
+  }
+
+  const unchangedFiles = new Set<string>();
+  for (const filePath of changedFiles) {
+    const normalized = normalizeRepoFilePath(filePath);
+    const previousContent = previousIndexedContents.get(normalized);
+    if (previousContent === undefined) {
+      return { recovered: false, reason: `missing indexed content for ${filePath}` };
+    }
+    const currentContent = await fs.readFile(path.join(repoPath, filePath), 'utf-8');
+    const guardReason = bodyOnlyContentGuardReason(filePath, previousContent, currentContent);
+    if (guardReason !== undefined) return { recovered: false, reason: guardReason };
+
+    const provider = semanticSurfaceProviderForFile(filePath);
+    if (provider === undefined) return { recovered: false, reason: `unsupported language for ${filePath}` };
+    const previousParsed = extractParsedFile(provider, previousContent, filePath);
+    const currentParsed = extractParsedFile(provider, currentContent, filePath);
+    if (!previousParsed || !currentParsed) {
+      return { recovered: false, reason: `could not parse previous/current content for ${filePath}` };
+    }
+    if (computeScopeFinalizeSurfaceHash(previousParsed) !== computeScopeFinalizeSurfaceHash(currentParsed)) {
+      return { recovered: false, reason: `semantic surface changed for ${filePath}` };
+    }
+    unchangedFiles.add(filePath);
+  }
+
+  log?.('Incremental body-only fast path: recovered semantic surface from indexed File content');
+  return {
+    recovered: true,
+    previousIndexedContents,
+    semanticSurface: {
+      unchangedFiles,
+      changedCount: 0,
+      unchangedCount: changedFiles.length,
+    },
+  };
+};
+
 const toFileHashesRecord = (fileHashes: ReadonlyMap<string, string>): Record<string, string> => {
   const record: Record<string, string> = {};
   for (const [k, v] of fileHashes) record[k] = v;
@@ -399,24 +523,6 @@ const bodyOnlyFastPathCandidateReason = (
   const unsupported = hashDiff.changed.find((filePath) => !isBodyOnlyFastPathLanguage(filePath));
   if (unsupported) return `unsupported language for ${unsupported}`;
   return undefined;
-};
-
-const readDbFileContent = async (
-  filePath: string,
-): Promise<{ ok: true; content: string } | { ok: false; reason: string }> => {
-  const rows = await executePrepared(
-    'MATCH (n:File) WHERE n.filePath = $filePath RETURN n.content AS content',
-    { filePath },
-  );
-  if (rows.length !== 1) {
-    return { ok: false, reason: `expected one File row for ${filePath}, found ${rows.length}` };
-  }
-  const row = rows[0] ?? {};
-  const content = row.content ?? row[0];
-  if (typeof content !== 'string') {
-    return { ok: false, reason: `missing previous File.content for ${filePath}` };
-  }
-  return { ok: true, content };
 };
 
 interface BodyOnlyFastPathProfileDetails {
@@ -527,6 +633,7 @@ const tryRunBodyOnlyFastPath = async (input: {
     finalCloseMs: number;
   };
   semanticSurfaceUnchangedFiles: number;
+  previousIndexedContents?: ReadonlyMap<string, string>;
 }): Promise<
   | { handled: false; reason: string }
   | { handled: true; result: AnalyzeResult; details: BodyOnlyFastPathProfileDetails }
@@ -534,7 +641,6 @@ const tryRunBodyOnlyFastPath = async (input: {
   const {
     repoPath,
     storagePath,
-    lbugPath,
     changedFiles,
     newFileHashes,
     existingMeta,
@@ -545,6 +651,7 @@ const tryRunBodyOnlyFastPath = async (input: {
     log,
     profile,
     semanticSurfaceUnchangedFiles,
+    previousIndexedContents: inputPreviousIndexedContents,
   } = input;
 
   const bodyStart = Date.now();
@@ -568,32 +675,65 @@ const tryRunBodyOnlyFastPath = async (input: {
   let lbugConnectionCloseMs = 0;
   let lbugDatabaseCloseMs = 0;
   let lbugWindowsReleaseMs = 0;
+  let previousIndexedContents = inputPreviousIndexedContents;
 
-  let lbugOpen = false;
+  const getPreviousIndexedContents = async (): Promise<ReadonlyMap<string, string> | null> => {
+    if (previousIndexedContents !== undefined) return previousIndexedContents;
+    const previousReadStart = Date.now();
+    const loaded = await loadIndexedBodyOnlyContents(input.lbugPath, changedFiles, profile);
+    bodyPreviousReadMs += Date.now() - previousReadStart;
+    previousIndexedContents = loaded ?? undefined;
+    return loaded;
+  };
+
   try {
-    const initStart = Date.now();
-    const openedExistingDb = await initExistingLbugForBodyOnlyUpdate(lbugPath);
-    if (!openedExistingDb) {
-      return { handled: false, reason: 'existing LadybugDB file is missing' };
-    }
-    lbugOpen = true;
-    profile.lbugInitMs += Date.now() - initStart;
-    const initTimings = getLastLbugInitTimings();
-    lbugOpenMs += initTimings.openMs;
-    lbugSchemaMs += initTimings.schemaMs;
-    lbugFtsLoadMs += initTimings.ftsMs;
-
     const validationStart = Date.now();
+    const stateLoadStart = Date.now();
+    const bodyOnlyState = await loadBodyOnlyState(storagePath);
+    bodyPreviousReadMs += Date.now() - stateLoadStart;
     for (const { filePath, content } of newContents) {
-      const previousReadStart = Date.now();
-      const previous = await readDbFileContent(filePath);
-      bodyPreviousReadMs += Date.now() - previousReadStart;
-      if ('reason' in previous) {
-        profile.validationMs += Date.now() - validationStart;
-        return { handled: false, reason: previous.reason };
-      }
+      const normalizedFilePath = normalizeRepoFilePath(filePath);
+      const stateEntry = bodyOnlyState?.entries[normalizedFilePath];
+      const indexedHash = existingMeta.fileHashes?.[filePath];
       const guardCheckStart = Date.now();
-      const guardReason = bodyOnlyContentGuardReason(filePath, previous.content, content);
+      let guardReason: string | undefined;
+      if (stateEntry && indexedHash && stateEntry.contentHash === indexedHash) {
+        if (stateEntry.lineCount !== content.split('\n').length) {
+          guardReason = `line count changed for ${filePath}`;
+        } else if (stateEntry.callExpressionSignature !== callExpressionSignature(content)) {
+          guardReason = `call expression surface changed for ${filePath}`;
+        } else if (content.length > DB_FILE_CONTENT_MAX_CHARS) {
+          guardReason = `file content is truncated or too large for ${filePath}`;
+        }
+        if (guardReason !== undefined) {
+          let previousContent = typeof stateEntry.content === 'string' ? stateEntry.content : undefined;
+          if (previousContent === undefined) {
+            try {
+              previousContent = (await getPreviousIndexedContents())?.get(normalizedFilePath);
+            } catch {
+              previousContent = undefined;
+            }
+          }
+          if (previousContent !== undefined) {
+            guardReason = bodyOnlyContentGuardReason(filePath, previousContent, content);
+          }
+        }
+      } else {
+        let previousContents: ReadonlyMap<string, string> | null = null;
+        try {
+          previousContents = await getPreviousIndexedContents();
+        } catch (err) {
+          guardReason = `could not read indexed file content: ${(err as Error).message}`;
+        }
+        const previousContent = previousContents?.get(normalizedFilePath);
+        if (guardReason === undefined && previousContent === undefined) {
+          guardReason = bodyOnlyState
+            ? `missing current body-only guard state for ${filePath}`
+            : 'missing body-only state cache';
+        } else if (guardReason === undefined && previousContent !== undefined) {
+          guardReason = bodyOnlyContentGuardReason(filePath, previousContent, content);
+        }
+      }
       bodyGuardCheckMs += Date.now() - guardCheckStart;
       if (guardReason !== undefined) {
         profile.validationMs += Date.now() - validationStart;
@@ -604,9 +744,9 @@ const tryRunBodyOnlyFastPath = async (input: {
 
     log(
       `Incremental body-only fast path: changed=${changedFiles.length}, ` +
-        'semantic surface unchanged; updating file/content rows only',
+        'semantic surface unchanged; updating content overlay only',
     );
-    progress('lbug', 60, 'Updating changed file content...');
+    progress('lbug', 60, 'Updating changed file content overlay...');
 
     const dirtyMetaStart = Date.now();
     await saveMeta(storagePath, {
@@ -618,24 +758,16 @@ const tryRunBodyOnlyFastPath = async (input: {
     });
     profile.dirtyMetaMs += Date.now() - dirtyMetaStart;
 
-    const dbWritebackStart = Date.now();
     const rowUpdateStart = Date.now();
-    const updateResult = await updateBodyOnlyFileContents(newContents);
+    await updateBodyOnlyOverlayState({
+      storagePath,
+      updates: newContents,
+      fileHashes: newFileHashes,
+    });
     bodyRowUpdateMs += Date.now() - rowUpdateStart;
     const statsStart = Date.now();
-    const stats = existingMeta.stats ?? (await getLbugStats());
+    const stats = existingMeta.stats ?? {};
     bodyStatsMs += Date.now() - statsStart;
-    profile.dbWritebackMs += Date.now() - dbWritebackStart;
-
-    const closeStart = Date.now();
-    await closeLbug();
-    lbugOpen = false;
-    profile.finalCloseMs += Date.now() - closeStart;
-    const closeTimings = getLastLbugCloseTimings();
-    lbugCheckpointMs += closeTimings.checkpointMs;
-    lbugConnectionCloseMs += closeTimings.connectionCloseMs;
-    lbugDatabaseCloseMs += closeTimings.databaseCloseMs;
-    lbugWindowsReleaseMs += closeTimings.windowsHandleReleaseMs;
 
     const metadataStart = Date.now();
     const meta = {
@@ -667,8 +799,8 @@ const tryRunBodyOnlyFastPath = async (input: {
 
     const details: BodyOnlyFastPathProfileDetails = {
       changedFiles: changedFiles.length,
-      updatedFiles: updateResult.updatedFiles,
-      updatedCodeNodes: updateResult.updatedCodeNodes,
+      updatedFiles: changedFiles.length,
+      updatedCodeNodes: 0,
       semanticSurfaceUnchangedFiles,
       bodyTotalMs: Date.now() - bodyStart,
       bodyContentReadMs,
@@ -696,16 +828,7 @@ const tryRunBodyOnlyFastPath = async (input: {
       details,
     };
   } finally {
-    if (lbugOpen) {
-      const closeStart = Date.now();
-      await closeLbug();
-      profile.finalCloseMs += Date.now() - closeStart;
-      const closeTimings = getLastLbugCloseTimings();
-      lbugCheckpointMs += closeTimings.checkpointMs;
-      lbugConnectionCloseMs += closeTimings.connectionCloseMs;
-      lbugDatabaseCloseMs += closeTimings.databaseCloseMs;
-      lbugWindowsReleaseMs += closeTimings.windowsHandleReleaseMs;
-    }
+    // The overlay body-only path intentionally does not open LadybugDB.
   }
 };
 
@@ -1078,10 +1201,34 @@ export async function runFullAnalysis(
     incrementalFreshFiles = new Set(hashDiff.toWrite);
     const priorFileSet = new Set(existingMeta?.fileHashes ? Object.keys(existingMeta.fileHashes) : []);
     const semanticSurfaceStart = Date.now();
-    const semanticSurface = hashDiff.added.length === 0 && hashDiff.deleted.length === 0
+    let semanticSurface = hashDiff.added.length === 0 && hashDiff.deleted.length === 0
       ? await computeChangedSemanticSurface(repoPath, storagePath, hashDiff.changed, log)
       : { unchangedFiles: new Set<string>(), changedCount: hashDiff.changed.length, unchangedCount: 0, invalidationReason: 'file set changed' };
     profile.semanticSurfaceMs += Date.now() - semanticSurfaceStart;
+    let recoveredPreviousIndexedContents: Map<string, string> | undefined;
+    if (
+      existingMeta &&
+      hashDiff.added.length === 0 &&
+      hashDiff.deleted.length === 0 &&
+      hashDiff.changed.length > 0 &&
+      hashDiff.changed.length <= BODY_ONLY_FAST_PATH_MAX_CHANGED_FILES &&
+      !isBodyOnlyFastPathDisabled() &&
+      semanticSurface.invalidationReason !== undefined
+    ) {
+      const recovery = await recoverBodyOnlySemanticSurfaceFromIndexedContent({
+        repoPath,
+        lbugPath,
+        changedFiles: hashDiff.changed,
+        profile,
+        log: isAnalyzeProfilingEnabled() ? log : undefined,
+      });
+      if (recovery.recovered) {
+        semanticSurface = recovery.semanticSurface;
+        recoveredPreviousIndexedContents = recovery.previousIndexedContents;
+      } else if ('reason' in recovery && isAnalyzeProfilingEnabled()) {
+        log(`Incremental body-only fast path cache recovery skipped: ${recovery.reason}`);
+      }
+    }
     semanticSurfaceChangedFiles = semanticSurface.changedCount;
     semanticSurfaceUnchangedFiles = semanticSurface.unchangedCount;
     finalizeInvalidationReason = semanticSurface.invalidationReason;
@@ -1114,6 +1261,7 @@ export async function runFullAnalysis(
           log,
           profile,
           semanticSurfaceUnchangedFiles,
+          previousIndexedContents: recoveredPreviousIndexedContents,
         });
         if ('result' in bodyOnlyFastPath) {
           const dbGuardReleaseStart = Date.now();
@@ -1297,12 +1445,22 @@ export async function runFullAnalysis(
     let lbugMsgCount = 0;
     if (isIncremental && hashDiff) {
       const writeSetPlanningStart = Date.now();
-      const writeSetPlan = await deriveIncrementalWriteSet({
-        hashDiff,
-        fullGraph: pipelineResult.graph,
-        priorFileHashes: existingMeta?.fileHashes,
-        queryImporters,
-      });
+      const pendingBodyOnlyOverlays = await loadFreshBodyOnlyContentOverlays(storagePath);
+      const pendingOverlayPaths = [...pendingBodyOnlyOverlays.keys()];
+      const overlaysAlreadyWritable = pendingOverlayPaths.every((filePath) =>
+        hashDiff.toWrite.includes(filePath),
+      );
+      const writeSetPlan = pendingOverlayPaths.length > 0 && !overlaysAlreadyWritable
+        ? {
+            mode: 'full' as const,
+            reason: 'pending body-only content overlays require materialization',
+          }
+        : await deriveIncrementalWriteSet({
+            hashDiff,
+            fullGraph: pipelineResult.graph,
+            priorFileHashes: existingMeta?.fileHashes,
+            queryImporters,
+          });
       profile.writeSetPlanningMs += Date.now() - writeSetPlanningStart;
 
       if (writeSetPlan.mode === 'full') {
@@ -1658,6 +1816,19 @@ export async function runFullAnalysis(
     };
     await saveMeta(storagePath, meta);
     profile.metadataMs += Date.now() - metadataStart;
+
+    try {
+      const bodyStateSaveStart = Date.now();
+      await saveMaterializedBodyOnlyStateFromRepo({
+        repoPath,
+        storagePath,
+        filePaths: allFilePaths,
+        fileHashes: newFileHashes,
+      });
+      profile.cacheSaveMs += Date.now() - bodyStateSaveStart;
+    } catch (e) {
+      log(`Warning: could not save body-only state cache (${(e as Error).message}); continuing.`);
+    }
 
     // Persist the incremental parse cache for the next run. Wraps in
     // try/catch so a cache-write failure never breaks an otherwise

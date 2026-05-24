@@ -27,6 +27,11 @@ import { isWriteQuery } from '../core/lbug/pool-adapter.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
+import {
+  loadFreshBodyOnlyContentOverlays,
+  overlayContentForNode,
+  type BodyOnlyContentOverlay,
+} from '../core/incremental/body-only-state.js';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
 import { fork } from 'child_process';
@@ -313,13 +318,17 @@ export const writeNdjsonRecord = async (
 
 const buildGraph = async (
   includeContent = false,
+  storagePath?: string,
 ): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const nodes: GraphNode[] = [];
+  const overlays = includeContent && storagePath
+    ? await loadFreshBodyOnlyContentOverlays(storagePath)
+    : undefined;
   for (const table of NODE_TABLES) {
     try {
       const rows = await executeQuery(getNodeQuery(table, includeContent));
       for (const row of rows) {
-        nodes.push(mapGraphNodeRow(table, row, includeContent));
+        nodes.push(mapGraphNodeRow(table, row, includeContent, overlays));
       }
     } catch (err) {
       if (!isIgnorableGraphQueryError(err)) {
@@ -371,29 +380,41 @@ const getNodeQuery = (table: string, includeContent: boolean): string => {
     : `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
 };
 
-const mapGraphNodeRow = (table: string, row: any, includeContent: boolean): GraphNode => ({
-  id: row.id ?? row[0],
-  label: table as GraphNode['label'],
-  properties: {
-    name: row.name ?? row.label ?? row[1],
-    filePath: row.filePath ?? row[2],
-    startLine: row.startLine,
-    endLine: row.endLine,
-    content: includeContent ? row.content : undefined,
-    responseKeys: row.responseKeys,
-    errorKeys: row.errorKeys,
-    middleware: row.middleware,
-    heuristicLabel: row.heuristicLabel,
-    cohesion: row.cohesion,
-    symbolCount: row.symbolCount,
-    description: row.description,
-    processType: row.processType,
-    stepCount: row.stepCount,
-    communities: row.communities,
-    entryPointId: row.entryPointId,
-    terminalId: row.terminalId,
-  } as GraphNode['properties'],
-});
+const mapGraphNodeRow = (
+  table: string,
+  row: any,
+  includeContent: boolean,
+  overlays?: ReadonlyMap<string, BodyOnlyContentOverlay>,
+): GraphNode => {
+  const filePath = row.filePath ?? row[2];
+  const overlay = typeof filePath === 'string' ? overlays?.get(filePath) : undefined;
+  const overlayContent = includeContent
+    ? overlayContentForNode(overlay, row.startLine, row.endLine)
+    : undefined;
+  return {
+    id: row.id ?? row[0],
+    label: table as GraphNode['label'],
+    properties: {
+      name: row.name ?? row.label ?? row[1],
+      filePath,
+      startLine: row.startLine,
+      endLine: row.endLine,
+      content: includeContent ? (overlayContent ?? row.content) : undefined,
+      responseKeys: row.responseKeys,
+      errorKeys: row.errorKeys,
+      middleware: row.middleware,
+      heuristicLabel: row.heuristicLabel,
+      cohesion: row.cohesion,
+      symbolCount: row.symbolCount,
+      description: row.description,
+      processType: row.processType,
+      stepCount: row.stepCount,
+      communities: row.communities,
+      entryPointId: row.entryPointId,
+      terminalId: row.terminalId,
+    } as GraphNode['properties'],
+  };
+};
 
 const mapGraphRelationshipRow = (row: any): GraphRelationship => ({
   id: `${row.sourceId}_${row.type}_${row.targetId}`,
@@ -409,7 +430,11 @@ export const streamGraphNdjson = async (
   res: express.Response,
   includeContent = false,
   signal?: AbortSignal,
+  storagePath?: string,
 ): Promise<void> => {
+  const overlays = includeContent && storagePath
+    ? await loadFreshBodyOnlyContentOverlays(storagePath)
+    : undefined;
   for (const table of NODE_TABLES) {
     try {
       await streamQuery(getNodeQuery(table, includeContent), async (row) => {
@@ -417,7 +442,7 @@ export const streamGraphNdjson = async (
           res,
           {
             type: 'node',
-            data: mapGraphNodeRow(table, row, includeContent),
+            data: mapGraphNodeRow(table, row, includeContent, overlays),
           },
           signal,
         );
@@ -985,7 +1010,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         try {
           await withLbugDb(lbugPath, async () =>
-            streamGraphNdjson(res, includeContent, abortController.signal),
+            streamGraphNdjson(res, includeContent, abortController.signal, entry.storagePath),
           );
           if (!abortController.signal.aborted && !res.writableEnded) {
             res.end();
@@ -998,7 +1023,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const graph = await withLbugDb(lbugPath, async () => buildGraph(includeContent));
+      const graph = await withLbugDb(lbugPath, async () => buildGraph(includeContent, entry.storagePath));
       res.json(graph);
     } catch (err: any) {
       if (err instanceof ClientDisconnectedError) {
@@ -1087,7 +1112,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             sources: ['semantic'],
           }));
         } else if (mode === 'bm25') {
-          const ftsResponse = await searchFTSFromLbug(query, limit);
+          const ftsResponse = await searchFTSFromLbug(query, limit, undefined, {
+            storagePath: entry.storagePath,
+          });
           ftsAvailable = ftsResponse.ftsAvailable;
           searchResults = ftsResponse.results.map((r: any, i: number) => ({
             ...r,
@@ -1100,9 +1127,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           if (isEmbedderReady()) {
             const { semanticSearch: semSearch } =
               await import('../core/embeddings/embedding-pipeline.js');
-            searchResults = await hybridSearch(query, limit, executeQuery, semSearch);
+            searchResults = await hybridSearch(query, limit, executeQuery, semSearch, {
+              storagePath: entry.storagePath,
+            });
           } else {
-            const ftsResponse = await searchFTSFromLbug(query, limit);
+            const ftsResponse = await searchFTSFromLbug(query, limit, undefined, {
+              storagePath: entry.storagePath,
+            });
             ftsAvailable = ftsResponse.ftsAvailable;
             searchResults = ftsResponse.results;
           }

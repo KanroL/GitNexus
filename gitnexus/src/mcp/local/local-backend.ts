@@ -1008,7 +1008,9 @@ export class LocalBackend {
     }
     let ftsResponse;
     try {
-      ftsResponse = await searchFTSFromLbug(query, limit, repo.id);
+      ftsResponse = await searchFTSFromLbug(query, limit, repo.id, {
+        storagePath: repo.storagePath,
+      });
     } catch (err: any) {
       logger.error(
         { err: err.message },

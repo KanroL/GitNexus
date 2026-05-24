@@ -1305,13 +1305,11 @@ export const updateBodyOnlyFileContents = async (
     'MATCH (n:File) WHERE n.filePath IN $filePaths RETURN n.filePath AS filePath',
     { filePaths },
   );
-  const existingFilePaths = new Set<string>();
   const filePathCounts = new Map<string, number>();
   for (const row of fileRows) {
     const filePath = row.filePath ?? row[0];
     if (typeof filePath !== 'string') continue;
     const normalized = normalizeGraphPath(filePath);
-    existingFilePaths.add(normalized);
     filePathCounts.set(normalized, (filePathCounts.get(normalized) ?? 0) + 1);
   }
   const invalidFilePaths = filePaths.filter((filePath) => filePathCounts.get(filePath) !== 1);

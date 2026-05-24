@@ -168,13 +168,16 @@ export const hybridSearch = async (
     query: string,
     k?: number,
   ) => Promise<SemanticSearchResult[]>,
+  options: { storagePath?: string } = {},
 ): Promise<HybridSearchResult[]> => {
   // Use LadybugDB FTS for always-fresh BM25 results.
   // If FTS fails (e.g. extension not loaded in MCP process), fall back to
   // semantic-only search instead of crashing with "bm25Results is not iterable".
   let bm25Results: BM25SearchResult[] = [];
   try {
-    const ftsResponse = await searchFTSFromLbug(query, limit);
+    const ftsResponse = await searchFTSFromLbug(query, limit, undefined, {
+      storagePath: options.storagePath,
+    });
     bm25Results = ftsResponse?.results ?? [];
   } catch {
     // FTS unavailable — continue with semantic-only search

@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { runFullAnalysis } from '../../src/core/run-analyze.js';
 import { closeLbug, executeQuery, initLbug } from '../../src/core/lbug/lbug-adapter.js';
 import { searchFTSFromLbug } from '../../src/core/search/bm25-index.js';
+import { loadFreshBodyOnlyContentOverlays } from '../../src/core/incremental/body-only-state.js';
 import { getStoragePaths, loadMeta } from '../../src/storage/repo-manager.js';
 import { getFileArtifactCacheDir, loadFileParseArtifact } from '../../src/storage/file-artifact-cache.js';
 import { buildStatusReport } from '../../src/cli/status.js';
@@ -160,7 +161,7 @@ async function setupSearchFreshnessRepo() {
 }
 
 async function queryRepo<T = any>(repoPath: string, cypher: string): Promise<T[]> {
-  const { lbugPath } = getStoragePaths(repoPath);
+  const { lbugPath, storagePath } = getStoragePaths(repoPath);
   await initLbug(lbugPath);
   try {
     return (await executeQuery(cypher)) as T[];
@@ -343,7 +344,7 @@ async function searchFreshnessSnapshot(
   repoPath: string,
   tokens: readonly string[],
 ): Promise<Record<string, { ftsAvailable: boolean; filePaths: string[]; nodeIds: string[] }>> {
-  const { lbugPath } = getStoragePaths(repoPath);
+  const { lbugPath, storagePath } = getStoragePaths(repoPath);
   await initLbug(lbugPath);
   try {
     const snapshot: Record<
@@ -351,7 +352,9 @@ async function searchFreshnessSnapshot(
       { ftsAvailable: boolean; filePaths: string[]; nodeIds: string[] }
     > = {};
     for (const token of tokens) {
-      const { results, ftsAvailable } = await searchFTSFromLbug(token, 10);
+      const { results, ftsAvailable } = await searchFTSFromLbug(token, 10, undefined, {
+        storagePath,
+      });
       snapshot[token] = {
         ftsAvailable,
         filePaths: results.map((result) => result.filePath).sort(),
@@ -738,12 +741,9 @@ export function useValue(): string {
       expect(incremental.pipelineResult).toBeUndefined();
       expect(logs.some((line) => line.includes('Incremental body-only fast path'))).toBe(true);
 
-      const functionRows = await queryRepo<{ content: string }>(
-        repo.dbPath,
-        "MATCH (n:Function) WHERE n.filePath = 'src/provider.ts' AND n.name = 'value' RETURN n.content AS content",
-      );
-      expect(functionRows[0]?.content).toContain('bodyfastnewterm');
-      expect(functionRows[0]?.content).not.toContain('bodyfastwarmterm');
+      const overlays = await loadFreshBodyOnlyContentOverlays(getStoragePaths(repo.dbPath).storagePath);
+      expect(overlays.get('src/provider.ts')?.content).toContain('bodyfastnewterm');
+      expect(overlays.get('src/provider.ts')?.content).not.toContain('bodyfastwarmterm');
 
       const incrementalSearch = await searchFreshnessSnapshot(repo.dbPath, [
         'bodyfastwarmterm',
@@ -763,6 +763,63 @@ export function useValue(): string {
     } finally {
       if (previousVerbose === undefined) delete process.env.GITNEXUS_VERBOSE;
       else process.env.GITNEXUS_VERBOSE = previousVerbose;
+      await closeLbug();
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('body-only fast path accepts constructor super message edits with missing warm caches', async () => {
+    const repo = await setupRepo();
+    try {
+      const errorsDir = path.join(repo.dbPath, 'source', 'errors');
+      await mkdir(errorsDir, { recursive: true });
+      const errorFile = path.join(errorsDir, 'HTTPError.ts');
+      await writeFile(
+        errorFile,
+        `export class HTTPError extends Error {
+  public readonly response: Response;
+
+  constructor(response: Response) {
+    super(\`Request failed with status code \${response.status}\`);
+    this.name = 'HTTPError';
+    this.response = response;
+  }
+}
+`,
+      );
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      await rm(path.join(storagePath, 'scope-finalize-cache', 'typescript.surface-hashes.json'), { force: true });
+      await rm(path.join(storagePath, 'incremental', 'body-only-state.json'), { force: true });
+
+      await writeFile(
+        errorFile,
+        `export class HTTPError extends Error {
+  public readonly response: Response;
+
+  constructor(response: Response) {
+    super(\`HTTP request failed with status code \${response.status}\`);
+    this.name = 'HTTPError';
+    this.response = response;
+  }
+}
+`,
+      );
+      const logs: string[] = [];
+      const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks(logs));
+      expect(incremental.pipelineResult).toBeUndefined();
+      expect(logs.some((line) => line.includes('Incremental body-only fast path'))).toBe(true);
+      expect(logs.some((line) => line.includes('Incremental fallback'))).toBe(false);
+
+      const overlays = await loadFreshBodyOnlyContentOverlays(storagePath);
+      expect(overlays.get('source/errors/HTTPError.ts')?.content).toContain(
+        'HTTP request failed with status code',
+      );
+      expect(overlays.get('source/errors/HTTPError.ts')?.content).not.toContain(
+        'Request failed with status code',
+      );
+    } finally {
       await closeLbug();
       await repo.cleanup();
     }

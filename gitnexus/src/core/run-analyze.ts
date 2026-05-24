@@ -17,12 +17,17 @@ import {
   loadGraphToLbug,
   getLbugStats,
   executeQuery,
+  executePrepared,
   executeWithReusedStatement,
   closeLbug,
   loadCachedEmbeddings,
   deleteNodesForFile,
   deleteAllCommunitiesAndProcesses,
   queryImporters,
+  updateBodyOnlyFileContents,
+  getLastLbugInitTimings,
+  getLastLbugCloseTimings,
+  initExistingLbugForBodyOnlyUpdate,
 } from './lbug/lbug-adapter.js';
 import { createSearchFTSIndexes } from './search/fts-indexes.js';
 import {
@@ -33,11 +38,13 @@ import {
   registerRepo,
   cleanupOldKuzuFiles,
   INCREMENTAL_SCHEMA_VERSION,
+  type RepoMeta,
 } from '../storage/repo-manager.js';
 import { computeFileHashes } from '../storage/file-hash.js';
 import {
   computeScopeFinalizeSurfaceHash,
   computeSemanticFinalizeSurface,
+  loadScopeFinalizeSurfaceHashes,
   loadScopeFinalizeSemanticSurfaces,
   type SemanticFinalizeSurface,
 } from '../storage/scope-finalize-cache.js';
@@ -50,6 +57,12 @@ import { deriveIncrementalPlan } from './incremental/plan.js';
 import { deriveIncrementalWriteSet } from './incremental/write-set.js';
 import { shadowCandidatesFor } from './incremental/shadow-candidates.js';
 import { validateIncrementalGraphConsistency } from './incremental/validation.js';
+import {
+  BODY_ONLY_FAST_PATH_MAX_CHANGED_FILES,
+  bodyOnlyContentGuardReason,
+  isBodyOnlyFastPathDisabled,
+  isBodyOnlyFastPathLanguage,
+} from './incremental/body-only-fast-path.js';
 import { loadParseCache, saveParseCache, pruneCache } from '../storage/parse-cache.js';
 import {
   saveFileParseArtifactsBatch,
@@ -298,7 +311,8 @@ const computeChangedSemanticSurface = async (
   unchangedCount: number;
   invalidationReason?: string;
 }> => {
-  const previousByLanguage = new Map<SupportedLanguages, Awaited<ReturnType<typeof loadScopeFinalizeSemanticSurfaces>>>();
+  const previousHashesByLanguage = new Map<SupportedLanguages, Awaited<ReturnType<typeof loadScopeFinalizeSurfaceHashes>>>();
+  const previousSurfacesByLanguage = new Map<SupportedLanguages, Awaited<ReturnType<typeof loadScopeFinalizeSemanticSurfaces>>>();
   const unchangedFiles = new Set<string>();
   let changedCount = 0;
   let unchangedCount = 0;
@@ -310,11 +324,11 @@ const computeChangedSemanticSurface = async (
       changedCount++;
       continue;
     }
-    if (!previousByLanguage.has(language)) {
-      previousByLanguage.set(language, await loadScopeFinalizeSemanticSurfaces(storagePath, language));
+    if (!previousHashesByLanguage.has(language)) {
+      previousHashesByLanguage.set(language, await loadScopeFinalizeSurfaceHashes(storagePath, language));
     }
-    const previous = previousByLanguage.get(language);
-    if (previous === null || previous === undefined) {
+    const previousHashes = previousHashesByLanguage.get(language);
+    if (previousHashes === null || previousHashes === undefined) {
       missingSurfaceCache = true;
       changedCount++;
       continue;
@@ -326,12 +340,22 @@ const computeChangedSemanticSurface = async (
       continue;
     }
     const currentHash = computeScopeFinalizeSurfaceHash(parsed);
-    if (previous.hashes[filePath] === currentHash) {
+    if (previousHashes[filePath] === currentHash) {
       unchangedFiles.add(filePath);
       unchangedCount++;
     } else {
       if (isAnalyzeProfilingEnabled()) {
-        log?.(formatSemanticSurfaceDiff(filePath, previous.hashes[filePath], currentHash, previous.surfaces[filePath], computeSemanticFinalizeSurface(parsed)));
+        if (!previousSurfacesByLanguage.has(language)) {
+          previousSurfacesByLanguage.set(language, await loadScopeFinalizeSemanticSurfaces(storagePath, language));
+        }
+        const previous = previousSurfacesByLanguage.get(language);
+        log?.(formatSemanticSurfaceDiff(
+          filePath,
+          previousHashes[filePath],
+          currentHash,
+          previous?.surfaces[filePath],
+          computeSemanticFinalizeSurface(parsed),
+        ));
       }
       changedCount++;
     }
@@ -342,6 +366,347 @@ const computeChangedSemanticSurface = async (
     unchangedCount,
     invalidationReason: missingSurfaceCache ? 'missing semantic surface cache' : changedCount > 0 ? 'semantic surface changed' : undefined,
   };
+};
+
+type SemanticSurfaceSummary = Awaited<ReturnType<typeof computeChangedSemanticSurface>>;
+
+const toFileHashesRecord = (fileHashes: ReadonlyMap<string, string>): Record<string, string> => {
+  const record: Record<string, string> = {};
+  for (const [k, v] of fileHashes) record[k] = v;
+  return record;
+};
+
+const bodyOnlyFastPathCandidateReason = (
+  hashDiff: {
+    changed: readonly string[];
+    added: readonly string[];
+    deleted: readonly string[];
+  },
+  semanticSurface: SemanticSurfaceSummary,
+): string | undefined => {
+  if (isBodyOnlyFastPathDisabled()) return 'disabled by GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH';
+  if (hashDiff.added.length > 0) return 'added files present';
+  if (hashDiff.deleted.length > 0) return 'deleted files present';
+  if (hashDiff.changed.length === 0) return 'no changed files';
+  if (hashDiff.changed.length > BODY_ONLY_FAST_PATH_MAX_CHANGED_FILES) {
+    return `changed file count ${hashDiff.changed.length} exceeds body-only fast path limit ${BODY_ONLY_FAST_PATH_MAX_CHANGED_FILES}`;
+  }
+  if (semanticSurface.invalidationReason !== undefined) return semanticSurface.invalidationReason;
+  if (semanticSurface.changedCount > 0) return 'semantic surface changed';
+  if (semanticSurface.unchangedCount !== hashDiff.changed.length) {
+    return 'semantic surface did not cover every changed file';
+  }
+  const unsupported = hashDiff.changed.find((filePath) => !isBodyOnlyFastPathLanguage(filePath));
+  if (unsupported) return `unsupported language for ${unsupported}`;
+  return undefined;
+};
+
+const readDbFileContent = async (
+  filePath: string,
+): Promise<{ ok: true; content: string } | { ok: false; reason: string }> => {
+  const rows = await executePrepared(
+    'MATCH (n:File) WHERE n.filePath = $filePath RETURN n.content AS content',
+    { filePath },
+  );
+  if (rows.length !== 1) {
+    return { ok: false, reason: `expected one File row for ${filePath}, found ${rows.length}` };
+  }
+  const row = rows[0] ?? {};
+  const content = row.content ?? row[0];
+  if (typeof content !== 'string') {
+    return { ok: false, reason: `missing previous File.content for ${filePath}` };
+  }
+  return { ok: true, content };
+};
+
+interface BodyOnlyFastPathProfileDetails {
+  changedFiles: number;
+  updatedFiles: number;
+  updatedCodeNodes: number;
+  semanticSurfaceUnchangedFiles: number;
+  bodyTotalMs: number;
+  bodyContentReadMs: number;
+  bodyPreviousReadMs: number;
+  bodyGuardCheckMs: number;
+  bodyRowUpdateMs: number;
+  bodyStatsMs: number;
+  lbugOpenMs: number;
+  lbugSchemaMs: number;
+  lbugFtsLoadMs: number;
+  lbugCheckpointMs: number;
+  lbugConnectionCloseMs: number;
+  lbugDatabaseCloseMs: number;
+  lbugWindowsReleaseMs: number;
+}
+
+const logBodyOnlyFastPathProfile = (
+  log: (message: string) => void,
+  profile: {
+    preflightMs: number;
+    hashMs: number;
+    incrementalPlanningMs: number;
+    dbGuardAcquireMs: number;
+    dbGuardReleaseMs: number;
+    semanticSurfaceMs: number;
+    lbugInitMs: number;
+    dirtyMetaMs: number;
+    dbWritebackMs: number;
+    validationMs: number;
+    metadataMs: number;
+    registryMs: number;
+    contextFilesMs: number;
+    finalCloseMs: number;
+  },
+  analyzeStart: number,
+  details: BodyOnlyFastPathProfileDetails,
+): void => {
+  const totalAnalyzeMs = Date.now() - analyzeStart;
+  const accounted =
+    profile.preflightMs +
+    profile.hashMs +
+    profile.incrementalPlanningMs +
+    profile.dbGuardAcquireMs +
+    profile.dbGuardReleaseMs +
+    profile.semanticSurfaceMs +
+    profile.lbugInitMs +
+    profile.dirtyMetaMs +
+    profile.dbWritebackMs +
+    profile.validationMs +
+    profile.metadataMs +
+    profile.registryMs +
+    profile.contextFilesMs +
+    profile.finalCloseMs;
+  log('Analyze profile:');
+  log(
+    `  fastPath: bodyOnlyContentUpdate=true, changedFiles=${details.changedFiles}, updatedFiles=${details.updatedFiles}, updatedCodeNodes=${details.updatedCodeNodes}`,
+  );
+  log(
+    `  bodyOnly: total=${formatMs(details.bodyTotalMs)}, classify=${formatMs(profile.semanticSurfaceMs)}, contentRead=${formatMs(details.bodyContentReadMs)}, previousRows=${formatMs(details.bodyPreviousReadMs)}, guardChecks=${formatMs(details.bodyGuardCheckMs)}, rowUpdate=${formatMs(details.bodyRowUpdateMs)}, stats=${formatMs(details.bodyStatsMs)}`,
+  );
+  log(
+    `  bodyOnlyDb: guardAcquire=${formatMs(profile.dbGuardAcquireMs)}, guardRelease=${formatMs(profile.dbGuardReleaseMs)}, open=${formatMs(details.lbugOpenMs)}, schema=${formatMs(details.lbugSchemaMs)}, ftsLoad=${formatMs(details.lbugFtsLoadMs)}, checkpoint=${formatMs(details.lbugCheckpointMs)}, connectionClose=${formatMs(details.lbugConnectionCloseMs)}, databaseClose=${formatMs(details.lbugDatabaseCloseMs)}, windowsRelease=${formatMs(details.lbugWindowsReleaseMs)}`,
+  );
+  log(
+    `  semanticSurface: changedFiles=0, unchangedFiles=${details.semanticSurfaceUnchangedFiles}, importerExpansionSkipped=${details.changedFiles}, finalizeInvalidationReason=none`,
+  );
+  log('  pipeline: total=0ms, scan=0ms, structure=0ms, parseExtract=0ms, crossFile=0ms, scopeResolution=0ms, communities=0ms, processes=0ms');
+  log(
+    `  db: writeback=${formatMs(profile.dbWritebackMs)}, init=${formatMs(profile.lbugInitMs)}, close=${formatMs(profile.finalCloseMs)}, dirtyMeta=${formatMs(profile.dirtyMetaMs)}, validation=${formatMs(profile.validationMs)}`,
+  );
+  log(
+    `  postDb: fts=0ms, metadata=${formatMs(profile.metadataMs)}, registry=${formatMs(profile.registryMs)}, contextFiles=${formatMs(profile.contextFilesMs)}`,
+  );
+  log(
+    `  orchestration: preflight=${formatMs(profile.preflightMs)}, parseCacheLoad=0ms, hash=${formatMs(profile.hashMs)}, incrementalPlanning=${formatMs(profile.incrementalPlanningMs)}, importerExpansion=0ms, accounted=${formatMs(accounted)}, unaccounted=${formatMs(totalAnalyzeMs - accounted)}, total=${formatMs(totalAnalyzeMs)}`,
+  );
+};
+
+const tryRunBodyOnlyFastPath = async (input: {
+  repoPath: string;
+  storagePath: string;
+  lbugPath: string;
+  changedFiles: readonly string[];
+  newFileHashes: ReadonlyMap<string, string>;
+  existingMeta: RepoMeta;
+  currentCommit: string;
+  repoHasGit: boolean;
+  options: AnalyzeOptions;
+  progress: (phase: string, percent: number, message: string) => void;
+  log: (message: string) => void;
+  profile: {
+    preflightMs: number;
+    hashMs: number;
+    incrementalPlanningMs: number;
+    lbugInitMs: number;
+    dirtyMetaMs: number;
+    dbWritebackMs: number;
+    validationMs: number;
+    metadataMs: number;
+    registryMs: number;
+    contextFilesMs: number;
+    finalCloseMs: number;
+  };
+  semanticSurfaceUnchangedFiles: number;
+}): Promise<
+  | { handled: false; reason: string }
+  | { handled: true; result: AnalyzeResult; details: BodyOnlyFastPathProfileDetails }
+> => {
+  const {
+    repoPath,
+    storagePath,
+    lbugPath,
+    changedFiles,
+    newFileHashes,
+    existingMeta,
+    currentCommit,
+    repoHasGit,
+    options,
+    progress,
+    log,
+    profile,
+    semanticSurfaceUnchangedFiles,
+  } = input;
+
+  const bodyStart = Date.now();
+  const newContents: Array<{ filePath: string; content: string }> = [];
+  const contentReadStart = Date.now();
+  for (const filePath of changedFiles) {
+    newContents.push({
+      filePath,
+      content: await fs.readFile(path.join(repoPath, filePath), 'utf-8'),
+    });
+  }
+  const bodyContentReadMs = Date.now() - contentReadStart;
+  let bodyPreviousReadMs = 0;
+  let bodyGuardCheckMs = 0;
+  let bodyRowUpdateMs = 0;
+  let bodyStatsMs = 0;
+  let lbugOpenMs = 0;
+  let lbugSchemaMs = 0;
+  let lbugFtsLoadMs = 0;
+  let lbugCheckpointMs = 0;
+  let lbugConnectionCloseMs = 0;
+  let lbugDatabaseCloseMs = 0;
+  let lbugWindowsReleaseMs = 0;
+
+  let lbugOpen = false;
+  try {
+    const initStart = Date.now();
+    const openedExistingDb = await initExistingLbugForBodyOnlyUpdate(lbugPath);
+    if (!openedExistingDb) {
+      return { handled: false, reason: 'existing LadybugDB file is missing' };
+    }
+    lbugOpen = true;
+    profile.lbugInitMs += Date.now() - initStart;
+    const initTimings = getLastLbugInitTimings();
+    lbugOpenMs += initTimings.openMs;
+    lbugSchemaMs += initTimings.schemaMs;
+    lbugFtsLoadMs += initTimings.ftsMs;
+
+    const validationStart = Date.now();
+    for (const { filePath, content } of newContents) {
+      const previousReadStart = Date.now();
+      const previous = await readDbFileContent(filePath);
+      bodyPreviousReadMs += Date.now() - previousReadStart;
+      if ('reason' in previous) {
+        profile.validationMs += Date.now() - validationStart;
+        return { handled: false, reason: previous.reason };
+      }
+      const guardCheckStart = Date.now();
+      const guardReason = bodyOnlyContentGuardReason(filePath, previous.content, content);
+      bodyGuardCheckMs += Date.now() - guardCheckStart;
+      if (guardReason !== undefined) {
+        profile.validationMs += Date.now() - validationStart;
+        return { handled: false, reason: guardReason };
+      }
+    }
+    profile.validationMs += Date.now() - validationStart;
+
+    log(
+      `Incremental body-only fast path: changed=${changedFiles.length}, ` +
+        'semantic surface unchanged; updating file/content rows only',
+    );
+    progress('lbug', 60, 'Updating changed file content...');
+
+    const dirtyMetaStart = Date.now();
+    await saveMeta(storagePath, {
+      ...existingMeta,
+      incrementalInProgress: {
+        startedAt: Date.now(),
+        toWriteCount: changedFiles.length,
+      },
+    });
+    profile.dirtyMetaMs += Date.now() - dirtyMetaStart;
+
+    const dbWritebackStart = Date.now();
+    const rowUpdateStart = Date.now();
+    const updateResult = await updateBodyOnlyFileContents(newContents);
+    bodyRowUpdateMs += Date.now() - rowUpdateStart;
+    const statsStart = Date.now();
+    const stats = existingMeta.stats ?? (await getLbugStats());
+    bodyStatsMs += Date.now() - statsStart;
+    profile.dbWritebackMs += Date.now() - dbWritebackStart;
+
+    const closeStart = Date.now();
+    await closeLbug();
+    lbugOpen = false;
+    profile.finalCloseMs += Date.now() - closeStart;
+    const closeTimings = getLastLbugCloseTimings();
+    lbugCheckpointMs += closeTimings.checkpointMs;
+    lbugConnectionCloseMs += closeTimings.connectionCloseMs;
+    lbugDatabaseCloseMs += closeTimings.databaseCloseMs;
+    lbugWindowsReleaseMs += closeTimings.windowsHandleReleaseMs;
+
+    const metadataStart = Date.now();
+    const meta = {
+      ...existingMeta,
+      repoPath,
+      lastCommit: currentCommit,
+      indexedAt: new Date().toISOString(),
+      remoteUrl: repoHasGit ? getRemoteUrl(repoPath) : undefined,
+      stats,
+      schemaVersion: repoHasGit ? INCREMENTAL_SCHEMA_VERSION : undefined,
+      fileHashes: repoHasGit ? toFileHashesRecord(newFileHashes) : undefined,
+      incrementalInProgress: undefined as
+        | { startedAt: number; toWriteCount: number }
+        | undefined,
+    };
+    await saveMeta(storagePath, meta);
+    profile.metadataMs += Date.now() - metadataStart;
+
+    const registryStart = Date.now();
+    const projectName = await registerRepo(repoPath, meta, {
+      name: options.registryName,
+      allowDuplicateName: options.allowDuplicateName,
+    });
+    profile.registryMs += Date.now() - registryStart;
+
+    const contextStart = Date.now();
+    await ensureGitNexusIgnored(repoPath);
+    profile.contextFilesMs += Date.now() - contextStart;
+
+    const details: BodyOnlyFastPathProfileDetails = {
+      changedFiles: changedFiles.length,
+      updatedFiles: updateResult.updatedFiles,
+      updatedCodeNodes: updateResult.updatedCodeNodes,
+      semanticSurfaceUnchangedFiles,
+      bodyTotalMs: Date.now() - bodyStart,
+      bodyContentReadMs,
+      bodyPreviousReadMs,
+      bodyGuardCheckMs,
+      bodyRowUpdateMs,
+      bodyStatsMs,
+      lbugOpenMs,
+      lbugSchemaMs,
+      lbugFtsLoadMs,
+      lbugCheckpointMs,
+      lbugConnectionCloseMs,
+      lbugDatabaseCloseMs,
+      lbugWindowsReleaseMs,
+    };
+
+    progress('done', 100, 'Done');
+    return {
+      handled: true,
+      result: {
+        repoName: projectName,
+        repoPath,
+        stats,
+      },
+      details,
+    };
+  } finally {
+    if (lbugOpen) {
+      const closeStart = Date.now();
+      await closeLbug();
+      profile.finalCloseMs += Date.now() - closeStart;
+      const closeTimings = getLastLbugCloseTimings();
+      lbugCheckpointMs += closeTimings.checkpointMs;
+      lbugConnectionCloseMs += closeTimings.connectionCloseMs;
+      lbugDatabaseCloseMs += closeTimings.databaseCloseMs;
+      lbugWindowsReleaseMs += closeTimings.windowsHandleReleaseMs;
+    }
+  }
 };
 
 const formatSemanticSurfaceDiff = (
@@ -455,6 +820,9 @@ export async function runFullAnalysis(
     parseCacheLoadMs: 0,
     hashMs: 0,
     incrementalPlanningMs: 0,
+    dbGuardAcquireMs: 0,
+    dbGuardReleaseMs: 0,
+    semanticSurfaceMs: 0,
     importerExpansionMs: 0,
     pipelineMs: 0,
     dbWritebackMs: 0,
@@ -617,7 +985,10 @@ export async function runFullAnalysis(
     };
   }
 
+  const dbGuardAcquireStart = Date.now();
   const dbWriteGuard = await acquireDbWriteLock(lbugPath);
+  profile.dbGuardAcquireMs += Date.now() - dbGuardAcquireStart;
+  let dbWriteGuardReleased = false;
   try {
   // We load caches only after the no-change incremental fast path. A no-op
   // analyze should not pay for parse-cache JSON reads or embedding preservation.
@@ -704,12 +1075,13 @@ export async function runFullAnalysis(
   let importerExpansionSkipped = 0;
   let finalizeInvalidationReason: string | undefined;
   if (isIncremental && hashDiff) {
-    const importerExpansionStart = Date.now();
     incrementalFreshFiles = new Set(hashDiff.toWrite);
     const priorFileSet = new Set(existingMeta?.fileHashes ? Object.keys(existingMeta.fileHashes) : []);
+    const semanticSurfaceStart = Date.now();
     const semanticSurface = hashDiff.added.length === 0 && hashDiff.deleted.length === 0
       ? await computeChangedSemanticSurface(repoPath, storagePath, hashDiff.changed, log)
       : { unchangedFiles: new Set<string>(), changedCount: hashDiff.changed.length, unchangedCount: 0, invalidationReason: 'file set changed' };
+    profile.semanticSurfaceMs += Date.now() - semanticSurfaceStart;
     semanticSurfaceChangedFiles = semanticSurface.changedCount;
     semanticSurfaceUnchangedFiles = semanticSurface.unchangedCount;
     finalizeInvalidationReason = semanticSurface.invalidationReason;
@@ -724,6 +1096,47 @@ export async function runFullAnalysis(
     }
     incrementalShadowCandidates = shadowCandidates;
 
+    if (existingMeta) {
+      const bodyOnlyCandidateReason = bodyOnlyFastPathCandidateReason(hashDiff, semanticSurface);
+      if (bodyOnlyCandidateReason === undefined) {
+        importerExpansionSkipped = hashDiff.toWrite.length;
+        const bodyOnlyFastPath = await tryRunBodyOnlyFastPath({
+          repoPath,
+          storagePath,
+          lbugPath,
+          changedFiles: hashDiff.changed,
+          newFileHashes,
+          existingMeta,
+          currentCommit,
+          repoHasGit,
+          options,
+          progress,
+          log,
+          profile,
+          semanticSurfaceUnchangedFiles,
+        });
+        if ('result' in bodyOnlyFastPath) {
+          const dbGuardReleaseStart = Date.now();
+          await dbWriteGuard.release();
+          dbWriteGuardReleased = true;
+          profile.dbGuardReleaseMs += Date.now() - dbGuardReleaseStart;
+          if (isAnalyzeProfilingEnabled()) {
+            logBodyOnlyFastPathProfile(
+              log,
+              profile,
+              analyzeStart,
+              bodyOnlyFastPath.details,
+            );
+          }
+          return bodyOnlyFastPath.result;
+        }
+        log(`Incremental body-only fast path skipped: ${bodyOnlyFastPath.reason}`);
+      } else if (isAnalyzeProfilingEnabled()) {
+        log(`Incremental body-only fast path ineligible: ${bodyOnlyCandidateReason}`);
+      }
+    }
+
+    const importerExpansionStart = Date.now();
     try {
       const initStart = Date.now();
       await initLbug(lbugPath);
@@ -804,7 +1217,7 @@ export async function runFullAnalysis(
             },
           }
         : {}),
-      ...(isIncremental ? { scopeFinalizeCache: { storagePath } } : {}),
+      ...(repoHasGit ? { scopeFinalizeCache: { storagePath } } : {}),
       ...(isIncremental && hashDiff && incrementalFreshFiles
         ? {
             partialScopeResolution: {
@@ -1474,6 +1887,10 @@ export async function runFullAnalysis(
     throw err;
   }
   } finally {
-    await dbWriteGuard.release();
+    if (!dbWriteGuardReleased) {
+      const dbGuardReleaseStart = Date.now();
+      await dbWriteGuard.release();
+      profile.dbGuardReleaseMs += Date.now() - dbGuardReleaseStart;
+    }
   }
 }

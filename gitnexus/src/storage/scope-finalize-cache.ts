@@ -33,6 +33,12 @@ export interface ScopeFinalizeCacheEntry {
   stats: FinalizeStats;
 }
 
+interface ScopeFinalizeSurfaceHashEntry {
+  version: string;
+  language: SupportedLanguages | string;
+  surfaceHashes: Record<string, string>;
+}
+
 export interface ScopeFinalizeCachedOutput {
   imports: ReadonlyMap<ScopeId, readonly ImportEdge[]>;
   bindings: ReadonlyMap<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>;
@@ -120,6 +126,13 @@ const sha256Hex = (input: string): string => createHash('sha256').update(input).
 
 const cacheFilePath = (storagePath: string, language: SupportedLanguages | string): string =>
   path.join(storagePath, CACHE_DIRNAME, `${String(language).replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
+
+const surfaceHashesCacheFilePath = (storagePath: string, language: SupportedLanguages | string): string =>
+  path.join(
+    storagePath,
+    CACHE_DIRNAME,
+    `${String(language).replace(/[^a-zA-Z0-9_-]/g, '_')}.surface-hashes.json`,
+  );
 
 export const computeScopeFinalizeSurfaceHash = (parsed: ParsedFile): string =>
   sha256Hex(stableJson(computeSemanticFinalizeSurface(parsed)));
@@ -277,6 +290,17 @@ const isCacheEntry = (value: unknown): value is ScopeFinalizeCacheEntry => {
   );
 };
 
+const isSurfaceHashEntry = (value: unknown): value is ScopeFinalizeSurfaceHashEntry => {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v.version === SCOPE_FINALIZE_CACHE_VERSION &&
+    typeof v.language === 'string' &&
+    typeof v.surfaceHashes === 'object' &&
+    v.surfaceHashes !== null
+  );
+};
+
 export const buildScopeFinalizeCacheMetadata = (
   language: SupportedLanguages | string,
   providerId: string,
@@ -339,9 +363,28 @@ export const loadScopeFinalizeSurfaceHashes = async (
   storagePath: string,
   language: SupportedLanguages | string,
 ): Promise<Record<string, string> | null> => {
+  const mainCachePath = cacheFilePath(storagePath, language);
+  const hashCachePath = surfaceHashesCacheFilePath(storagePath, language);
+  try {
+    const [mainStat, hashStat] = await Promise.all([
+      fs.stat(mainCachePath),
+      fs.stat(hashCachePath),
+    ]);
+    if (hashStat.mtimeMs >= mainStat.mtimeMs) {
+      const entry = JSON.parse(
+        await fs.readFile(hashCachePath, 'utf-8'),
+      ) as ScopeFinalizeSurfaceHashEntry;
+      if (isSurfaceHashEntry(entry) && entry.language === language) {
+        return entry.surfaceHashes;
+      }
+    }
+  } catch {
+    // Fall through to the full cache for compatibility with existing indexes.
+  }
+
   try {
     const entry = JSON.parse(
-      await fs.readFile(cacheFilePath(storagePath, language), 'utf-8'),
+      await fs.readFile(mainCachePath, 'utf-8'),
       jsonReviver,
     ) as ScopeFinalizeCacheEntry;
     if (!isCacheEntry(entry)) return null;
@@ -391,4 +434,13 @@ export const saveScopeFinalizeCache = async (
   };
   await fs.writeFile(`${cachePath}.tmp`, JSON.stringify(entry, jsonReplacer), 'utf-8');
   await fs.rename(`${cachePath}.tmp`, cachePath);
+
+  const hashCachePath = surfaceHashesCacheFilePath(storagePath, metadata.language);
+  const hashEntry: ScopeFinalizeSurfaceHashEntry = {
+    version: SCOPE_FINALIZE_CACHE_VERSION,
+    language: metadata.language,
+    surfaceHashes: metadata.surfaceHashes,
+  };
+  await fs.writeFile(`${hashCachePath}.tmp`, JSON.stringify(hashEntry), 'utf-8');
+  await fs.rename(`${hashCachePath}.tmp`, hashCachePath);
 };

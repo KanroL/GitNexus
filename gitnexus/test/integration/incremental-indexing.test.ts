@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { access, mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
@@ -559,7 +559,8 @@ describe('incremental indexing integration', () => {
 
       expect(result.alreadyUpToDate).toBeUndefined();
       expect(logs).not.toContain('Already up to date');
-      expect(events).toContain('extracting');
+      expect(events.length).toBeGreaterThan(0);
+      expect(logs.some((line) => line.includes('Incremental body-only fast path')) || events.includes('extracting')).toBe(true);
     } finally {
       await repo.cleanup();
     }
@@ -586,8 +587,22 @@ describe('incremental indexing integration', () => {
       await runFullAnalysis(repo.dbPath, { ...analyzeOptions, force: true }, callbacks());
 
       await writeFile(path.join(repo.dbPath, 'src', 'local.ts'), 'export const local = 2;\n');
-      const gitStatus = execSync(
-        "git status --porcelain -- . ':(exclude).gitnexus' ':(exclude).gitnexus/**' ':(exclude).claude' ':(exclude).claude/**' ':(exclude).cursor' ':(exclude).cursor/**' ':(exclude)AGENTS.md' ':(exclude)CLAUDE.md'",
+      const gitStatus = execFileSync(
+        'git',
+        [
+          'status',
+          '--porcelain',
+          '--',
+          '.',
+          ':(exclude).gitnexus',
+          ':(exclude).gitnexus/**',
+          ':(exclude).claude',
+          ':(exclude).claude/**',
+          ':(exclude).cursor',
+          ':(exclude).cursor/**',
+          ':(exclude)AGENTS.md',
+          ':(exclude)CLAUDE.md',
+        ],
         { cwd: repo.dbPath, encoding: 'utf8' },
       );
       expect(gitStatus.trim()).toBe('');
@@ -614,7 +629,8 @@ describe('incremental indexing integration', () => {
 
       expect(result.alreadyUpToDate).toBeUndefined();
       expect(logs).not.toContain('Already up to date');
-      expect(events).toContain('extracting');
+      expect(events.length).toBeGreaterThan(0);
+      expect(logs.some((line) => line.includes('Incremental body-only fast path')) || events.includes('extracting')).toBe(true);
     } finally {
       if (previousNoGitignore === undefined) delete process.env.GITNEXUS_NO_GITIGNORE;
       else process.env.GITNEXUS_NO_GITIGNORE = previousNoGitignore;
@@ -625,11 +641,13 @@ describe('incremental indexing integration', () => {
   it('body-only incremental edit reuses cached scope finalize output', async () => {
     const repo = await setupRepo();
     const previousVerbose = process.env.GITNEXUS_VERBOSE;
+    const previousDisableFastPath = process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
     const workerOptions = {
       ...analyzeOptions,
       workerThresholdsForTest: { minFiles: 1, minBytes: 1 },
     };
     try {
+      process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = '1';
       await runFullAnalysis(repo.dbPath, { ...workerOptions, force: true }, callbacks());
 
       await writeFile(
@@ -643,7 +661,7 @@ export function useValue(): string {
 `,
       );
       const warm = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
-      expect(warm.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
+      expect(warm.pipelineResult?.scopeStats.finalizeCacheHits).toBeGreaterThan(0);
 
       await writeFile(
         path.join(repo.dbPath, 'src', 'provider.ts'),
@@ -674,6 +692,78 @@ export function useValue(): string {
     } finally {
       if (previousVerbose === undefined) delete process.env.GITNEXUS_VERBOSE;
       else process.env.GITNEXUS_VERBOSE = previousVerbose;
+      if (previousDisableFastPath === undefined) delete process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
+      else process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = previousDisableFastPath;
+      await repo.cleanup();
+    }
+  }, 600_000);
+
+  it('body-only fast path updates changed content and search while preserving graph topology', async () => {
+    const repo = await setupRepo();
+    const previousVerbose = process.env.GITNEXUS_VERBOSE;
+    try {
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'provider.ts'),
+        `export function value(): string {
+  return 'bodyfastoldterm';
+}
+`,
+      );
+      await runFullAnalysis(
+        repo.dbPath,
+        { ...analyzeOptions, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
+        callbacks(),
+      );
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'provider.ts'),
+        `export function value(): string {
+  return 'bodyfastwarmterm';
+}
+`,
+      );
+      await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks());
+      const beforeStructure = await persistentStructureTopology(repo.dbPath);
+      const beforeRelationships = await crossFileRelationshipTopology(repo.dbPath);
+
+      await writeFile(
+        path.join(repo.dbPath, 'src', 'provider.ts'),
+        `export function value(): string {
+  return 'bodyfastnewterm';
+}
+`,
+      );
+      const logs: string[] = [];
+      process.env.GITNEXUS_VERBOSE = '1';
+      const incremental = await runFullAnalysis(repo.dbPath, analyzeOptions, callbacks(logs));
+      expect(incremental.pipelineResult).toBeUndefined();
+      expect(logs.some((line) => line.includes('Incremental body-only fast path'))).toBe(true);
+
+      const functionRows = await queryRepo<{ content: string }>(
+        repo.dbPath,
+        "MATCH (n:Function) WHERE n.filePath = 'src/provider.ts' AND n.name = 'value' RETURN n.content AS content",
+      );
+      expect(functionRows[0]?.content).toContain('bodyfastnewterm');
+      expect(functionRows[0]?.content).not.toContain('bodyfastwarmterm');
+
+      const incrementalSearch = await searchFreshnessSnapshot(repo.dbPath, [
+        'bodyfastwarmterm',
+        'bodyfastnewterm',
+      ]);
+      expect(incrementalSearch.bodyfastnewterm.filePaths).toContain('src/provider.ts');
+      expect(incrementalSearch.bodyfastwarmterm.filePaths).toHaveLength(0);
+      expect(await persistentStructureTopology(repo.dbPath)).toEqual(beforeStructure);
+      expect(await crossFileRelationshipTopology(repo.dbPath)).toEqual(beforeRelationships);
+
+      await runFullAnalysis(repo.dbPath, { ...analyzeOptions, force: true }, callbacks());
+      expect(incrementalSearch).toEqual(
+        await searchFreshnessSnapshot(repo.dbPath, ['bodyfastwarmterm', 'bodyfastnewterm']),
+      );
+      expect(beforeStructure).toEqual(await persistentStructureTopology(repo.dbPath));
+      expect(beforeRelationships).toEqual(await crossFileRelationshipTopology(repo.dbPath));
+    } finally {
+      if (previousVerbose === undefined) delete process.env.GITNEXUS_VERBOSE;
+      else process.env.GITNEXUS_VERBOSE = previousVerbose;
+      await closeLbug();
       await repo.cleanup();
     }
   }, 600_000);
@@ -688,7 +778,7 @@ export function useValue(): string {
       await runFullAnalysis(repo.dbPath, { ...workerOptions, force: true }, callbacks());
       await writeFile(path.join(repo.dbPath, 'src', 'extra.ts'), 'export function extra(): number { return 2; }\n');
       const warm = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
-      expect(warm.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
+      expect(warm.pipelineResult?.scopeStats.finalizeCacheHits).toBeGreaterThan(0);
 
       await writeFile(
         path.join(repo.dbPath, 'src', 'provider.ts'),
@@ -703,7 +793,9 @@ export function useValue(): string {
 }
 `,
       );
-      const renamed = await runFullAnalysis(repo.dbPath, workerOptions, callbacks());
+      const logs: string[] = [];
+      const renamed = await runFullAnalysis(repo.dbPath, workerOptions, callbacks(logs));
+      expect(logs.some((line) => line.includes('Incremental body-only fast path'))).toBe(false);
       expect(renamed.pipelineResult?.scopeStats.finalizeCacheHits ?? 0).toBe(0);
       expect(renamed.pipelineResult?.scopeStats.finalizeCacheMisses).toBeGreaterThan(0);
       expect(renamed.pipelineResult?.scopeStats.partialEnabled).toBe(false);
@@ -1132,7 +1224,9 @@ export function makeMessage(): string {
 
   it('warm incremental replays unchanged file artifacts and parses fewer files', async () => {
     const repo = await setupWorkerArtifactRepo();
+    const previousDisableFastPath = process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
     try {
+      process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = '1';
       await runFullAnalysis(
         repo.dbPath,
         { ...analyzeOptions, force: true, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
@@ -1171,6 +1265,8 @@ export function makeMessage(): string {
       });
       expect(report.isUpToDate).toBe(true);
     } finally {
+      if (previousDisableFastPath === undefined) delete process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
+      else process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = previousDisableFastPath;
       await closeLbug();
       await repo.cleanup();
     }
@@ -1178,7 +1274,9 @@ export function makeMessage(): string {
 
   it('warm incremental parses missing artifact files fresh without disabling replay', async () => {
     const repo = await setupWorkerArtifactRepo();
+    const previousDisableFastPath = process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
     try {
+      process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = '1';
       await runFullAnalysis(
         repo.dbPath,
         { ...analyzeOptions, force: true, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
@@ -1221,6 +1319,8 @@ export function makeMessage(): string {
       });
       expect(report.isUpToDate).toBe(true);
     } finally {
+      if (previousDisableFastPath === undefined) delete process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
+      else process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = previousDisableFastPath;
       await closeLbug();
       await repo.cleanup();
     }
@@ -1228,7 +1328,9 @@ export function makeMessage(): string {
 
   it('small replay scope misses patch the finalize cache instead of global finalize', async () => {
     const repo = await setupWorkerArtifactRepo();
+    const previousDisableFastPath = process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
     try {
+      process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = '1';
       await runFullAnalysis(
         repo.dbPath,
         { ...analyzeOptions, force: true, workerThresholdsForTest: { minFiles: 1, minBytes: 1 } },
@@ -1272,6 +1374,8 @@ export function makeMessage(): string {
 
       await assertIncrementalMatchesForce(repo.dbPath);
     } finally {
+      if (previousDisableFastPath === undefined) delete process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH;
+      else process.env.GITNEXUS_DISABLE_BODY_ONLY_FAST_PATH = previousDisableFastPath;
       await closeLbug();
       await repo.cleanup();
     }

@@ -14,7 +14,7 @@ import {
   STALE_HASH_SENTINEL,
   NodeTableName,
 } from './schema.js';
-import { streamAllCSVsToDisk } from './csv-generator.js';
+import { isBinaryContent, sanitizeUTF8, streamAllCSVsToDisk } from './csv-generator.js';
 import type { CachedEmbedding } from '../embeddings/types.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
 import {
@@ -155,6 +155,20 @@ let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
 let vectorExtensionLoaded = false;
+let lastInitTimings = {
+  totalMs: 0,
+  openMs: 0,
+  schemaMs: 0,
+  ftsMs: 0,
+  reused: false,
+};
+let lastCloseTimings = {
+  totalMs: 0,
+  checkpointMs: 0,
+  connectionCloseMs: 0,
+  databaseCloseMs: 0,
+  windowsHandleReleaseMs: 0,
+};
 
 /**
  * In-process cache of FTS indexes observed against the current singleton
@@ -166,6 +180,18 @@ let vectorExtensionLoaded = false;
 const ensuredFTSIndexes = new Set<string>();
 
 const ftsIndexKey = (tableName: string, indexName: string): string => `${tableName}:${indexName}`;
+
+const BODY_ONLY_TS_JS_CONTENT_TABLES = [
+  'Function',
+  'Class',
+  'Interface',
+  'Method',
+  'CodeElement',
+] as const;
+
+const MAX_FILE_CONTENT = 10000;
+const MAX_SNIPPET_CONTENT = 5000;
+const TRUNCATED_SUFFIX = '\n... [truncated]';
 
 /**
  * Check if an error indicates a missing column or table (schema-level problem)
@@ -440,6 +466,73 @@ export const initLbug = async (dbPath: string) => {
 };
 
 /**
+ * Open an already-initialized LadybugDB for a narrow body-only content update.
+ *
+ * The caller must have already established incremental eligibility/schema
+ * compatibility from repo metadata. This avoids replaying idempotent schema
+ * creation on the hot path, but still loads FTS because LadybugDB refuses to
+ * update indexed content columns while the extension is unloaded. Missing DBs
+ * are refused so uncertain states fall back to the normal analyze path.
+ */
+export const initExistingLbugForBodyOnlyUpdate = async (dbPath: string): Promise<boolean> => {
+  return runWithSessionLock(async () => {
+    if (conn && currentDbPath === dbPath) {
+      lastInitTimings = {
+        totalMs: 0,
+        openMs: 0,
+        schemaMs: 0,
+        ftsMs: 0,
+        reused: true,
+      };
+      return true;
+    }
+
+    const initStart = Date.now();
+    lastInitTimings = {
+      totalMs: 0,
+      openMs: 0,
+      schemaMs: 0,
+      ftsMs: 0,
+      reused: false,
+    };
+
+    let existingStat;
+    try {
+      existingStat = await fs.lstat(dbPath);
+    } catch (err) {
+      if (isMissingFileError(err)) return false;
+      throw err;
+    }
+    if (!existingStat.isFile()) return false;
+
+    if (conn || db) {
+      await safeClose();
+      currentDbPath = null;
+      ftsLoaded = false;
+      vectorExtensionLoaded = false;
+      ensuredFTSIndexes.clear();
+    }
+
+    const releaseInitLock = await acquireInitLock(dbPath);
+    try {
+      const openStart = Date.now();
+      const opened = await openLbugConnection(lbug, dbPath);
+      lastInitTimings.openMs += Date.now() - openStart;
+      db = opened.db;
+      conn = opened.conn;
+      const ftsStart = Date.now();
+      await loadFTSExtension();
+      lastInitTimings.ftsMs += Date.now() - ftsStart;
+      currentDbPath = dbPath;
+      lastInitTimings.totalMs = Date.now() - initStart;
+      return true;
+    } finally {
+      await releaseInitLock();
+    }
+  });
+};
+
+/**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
  *
@@ -496,6 +589,13 @@ export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>)
 
 const ensureLbugInitialized = async (dbPath: string) => {
   if (conn && currentDbPath === dbPath) {
+    lastInitTimings = {
+      totalMs: 0,
+      openMs: 0,
+      schemaMs: 0,
+      ftsMs: 0,
+      reused: true,
+    };
     return { db, conn };
   }
   await doInitLbug(dbPath);
@@ -503,6 +603,14 @@ const ensureLbugInitialized = async (dbPath: string) => {
 };
 
 const doInitLbug = async (dbPath: string) => {
+  const initStart = Date.now();
+  lastInitTimings = {
+    totalMs: 0,
+    openMs: 0,
+    schemaMs: 0,
+    ftsMs: 0,
+    reused: false,
+  };
   // Different database requested — close the old one first
   if (conn || db) {
     await safeClose();
@@ -586,13 +694,16 @@ const doInitLbug = async (dbPath: string) => {
     const parentDir = path.dirname(dbPath);
     await fs.mkdir(parentDir, { recursive: true });
 
+    const openStart = Date.now();
     const opened = await openLbugConnection(lbug, dbPath);
+    lastInitTimings.openMs += Date.now() - openStart;
     db = opened.db;
     conn = opened.conn;
   } finally {
     await releaseInitLock();
   }
 
+  const schemaStart = Date.now();
   for (const schemaQuery of SCHEMA_QUERIES) {
     try {
       await queryAndDrain(conn, schemaQuery);
@@ -612,12 +723,16 @@ const doInitLbug = async (dbPath: string) => {
       }
     }
   }
+  lastInitTimings.schemaMs += Date.now() - schemaStart;
 
   // FTS powers baseline search, so initialize it with the core DB. VECTOR is
   // only required for semantic embeddings and is probed lazily there.
+  const ftsStart = Date.now();
   await loadFTSExtension();
+  lastInitTimings.ftsMs += Date.now() - ftsStart;
 
   currentDbPath = dbPath;
+  lastInitTimings.totalMs = Date.now() - initStart;
   return { db, conn };
 };
 
@@ -1127,6 +1242,133 @@ export const executePrepared = async (
   return await readQueryRows(queryResult);
 };
 
+export interface BodyOnlyFileContentUpdate {
+  filePath: string;
+  content: string;
+}
+
+export interface BodyOnlyFileContentUpdateResult {
+  updatedFiles: number;
+  updatedCodeNodes: number;
+}
+
+const fileContentForDb = (content: string): string => {
+  const sanitized = sanitizeUTF8(content);
+  if (isBinaryContent(sanitized)) return '[Binary file - content not stored]';
+  return sanitized.length > MAX_FILE_CONTENT
+    ? sanitized.slice(0, MAX_FILE_CONTENT) + TRUNCATED_SUFFIX
+    : sanitized;
+};
+
+const snippetContentForDb = (
+  content: string,
+  startLine: unknown,
+  endLine: unknown,
+): string | undefined => {
+  const startLineNumber = Number(startLine);
+  const endLineNumber = Number(endLine);
+  if (!Number.isFinite(startLineNumber) || !Number.isFinite(endLineNumber)) return undefined;
+  if (startLineNumber < 0 || endLineNumber < 0) return undefined;
+  const sanitized = sanitizeUTF8(content);
+  if (isBinaryContent(sanitized)) return '[Binary file - content not stored]';
+  const lines = sanitized.split('\n');
+  const start = Math.max(0, startLineNumber - 2);
+  const end = Math.min(lines.length - 1, endLineNumber + 2);
+  const snippet = lines.slice(start, end + 1).join('\n');
+  return snippet.length > MAX_SNIPPET_CONTENT
+    ? snippet.slice(0, MAX_SNIPPET_CONTENT) + TRUNCATED_SUFFIX
+    : snippet;
+};
+
+export const updateBodyOnlyFileContents = async (
+  updates: readonly BodyOnlyFileContentUpdate[],
+): Promise<BodyOnlyFileContentUpdateResult> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  if (updates.length === 0) return { updatedFiles: 0, updatedCodeNodes: 0 };
+
+  let updatedFiles = 0;
+  let updatedCodeNodes = 0;
+
+  const updatesByPath = new Map<string, BodyOnlyFileContentUpdate>();
+  for (const update of updates) {
+    const filePath = normalizeGraphPath(update.filePath);
+    if (updatesByPath.has(filePath)) {
+      throw new Error(`Duplicate body-only update for ${filePath}`);
+    }
+    updatesByPath.set(filePath, { ...update, filePath });
+  }
+  const filePaths = [...updatesByPath.keys()];
+
+  const fileRows = await executePrepared(
+    'MATCH (n:File) WHERE n.filePath IN $filePaths RETURN n.filePath AS filePath',
+    { filePaths },
+  );
+  const existingFilePaths = new Set<string>();
+  const filePathCounts = new Map<string, number>();
+  for (const row of fileRows) {
+    const filePath = row.filePath ?? row[0];
+    if (typeof filePath !== 'string') continue;
+    const normalized = normalizeGraphPath(filePath);
+    existingFilePaths.add(normalized);
+    filePathCounts.set(normalized, (filePathCounts.get(normalized) ?? 0) + 1);
+  }
+  const invalidFilePaths = filePaths.filter((filePath) => filePathCounts.get(filePath) !== 1);
+  if (invalidFilePaths.length > 0) {
+    throw new Error(
+      `Expected exactly one File row for every body-only update; invalid ${invalidFilePaths.join(', ')}`,
+    );
+  }
+
+  await executeWithReusedStatement(
+    'MATCH (n:File) WHERE n.filePath = $filePath SET n.content = $content',
+    filePaths.map((filePath) => {
+      const update = updatesByPath.get(filePath);
+      if (!update) throw new Error(`Missing body-only update payload for ${filePath}`);
+      return {
+        filePath,
+        content: fileContentForDb(update.content),
+      };
+    }),
+  );
+  updatedFiles += filePaths.length;
+
+  for (const tableName of BODY_ONLY_TS_JS_CONTENT_TABLES) {
+    const escapedTable = escapeTableName(tableName);
+    const rows = await executePrepared(
+      `MATCH (n:${escapedTable}) WHERE n.filePath IN $filePaths ` +
+        'RETURN n.id AS id, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine',
+      { filePaths },
+    );
+    if (rows.length === 0) continue;
+
+    const paramsList: Array<Record<string, unknown>> = [];
+    for (const row of rows) {
+      const filePath = row.filePath ?? row[1];
+      const update = typeof filePath === 'string'
+        ? updatesByPath.get(normalizeGraphPath(filePath))
+        : undefined;
+      if (!update) continue;
+      const id = row.id ?? row[0];
+      if (typeof id !== 'string') {
+        throw new Error(`Missing node id while updating body-only content for ${update.filePath}`);
+      }
+      const content = snippetContentForDb(update.content, row.startLine, row.endLine);
+      if (content === undefined) continue;
+      paramsList.push({ id, content });
+    }
+    if (paramsList.length === 0) continue;
+    await executeWithReusedStatement(
+      `MATCH (n:${escapedTable}) WHERE n.id = $id SET n.content = $content`,
+      paramsList,
+    );
+    updatedCodeNodes += paramsList.length;
+  }
+
+  return { updatedFiles, updatedCodeNodes };
+};
+
 export const executeWithReusedStatement = async (
   cypher: string,
   paramsList: Array<Record<string, any>>,
@@ -1357,6 +1599,26 @@ export const flushWAL = async (): Promise<void> => {
   }
 };
 
+export interface LbugInitTimings {
+  totalMs: number;
+  openMs: number;
+  schemaMs: number;
+  ftsMs: number;
+  reused: boolean;
+}
+
+export interface LbugCloseTimings {
+  totalMs: number;
+  checkpointMs: number;
+  connectionCloseMs: number;
+  databaseCloseMs: number;
+  windowsHandleReleaseMs: number;
+}
+
+export const getLastLbugInitTimings = (): LbugInitTimings => ({ ...lastInitTimings });
+
+export const getLastLbugCloseTimings = (): LbugCloseTimings => ({ ...lastCloseTimings });
+
 /**
  * Flush the WAL and close the connection and database handles.
  *
@@ -1368,14 +1630,26 @@ export const flushWAL = async (): Promise<void> => {
  * @see closeLbug — safeClose + module state reset (full teardown)
  */
 export const safeClose = async (): Promise<void> => {
+  const closeStart = Date.now();
+  lastCloseTimings = {
+    totalMs: 0,
+    checkpointMs: 0,
+    connectionCloseMs: 0,
+    databaseCloseMs: 0,
+    windowsHandleReleaseMs: 0,
+  };
+  const checkpointStart = Date.now();
   await flushWAL();
+  lastCloseTimings.checkpointMs += Date.now() - checkpointStart;
   // Capture before close — currentDbPath stays set so the Windows post-close
   // probe below knows which file to wait on.
   const closingDbPath = currentDbPath;
   if (conn) {
     try {
       // eslint-disable-next-line no-restricted-syntax -- sole authorised close site
+      const connectionCloseStart = Date.now();
       await conn.close();
+      lastCloseTimings.connectionCloseMs += Date.now() - connectionCloseStart;
     } catch {
       /* best-effort */
     }
@@ -1384,7 +1658,9 @@ export const safeClose = async (): Promise<void> => {
   if (db) {
     try {
       // eslint-disable-next-line no-restricted-syntax -- sole authorised close site
+      const databaseCloseStart = Date.now();
       await db.close();
+      lastCloseTimings.databaseCloseMs += Date.now() - databaseCloseStart;
     } catch {
       /* best-effort */
     }
@@ -1396,7 +1672,9 @@ export const safeClose = async (): Promise<void> => {
   // forces any residual lock to surface as EBUSY/EPERM/EACCES so the
   // open-time retry absorbs the lag.
   if (process.platform === 'win32' && closingDbPath) {
+    const windowsReleaseStart = Date.now();
     const released = await waitForWindowsHandleRelease(closingDbPath);
+    lastCloseTimings.windowsHandleReleaseMs += Date.now() - windowsReleaseStart;
     if (!released) {
       // Probe exhausted with a lock code still in flight. The next
       // openLbugConnection will absorb whatever residual lag remains, but
@@ -1408,6 +1686,7 @@ export const safeClose = async (): Promise<void> => {
       );
     }
   }
+  lastCloseTimings.totalMs = Date.now() - closeStart;
 };
 
 export const closeLbug = async (): Promise<void> => {

@@ -40,6 +40,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.js",
+    "bench:incremental": "tsx scripts/bench-incremental-performance.ts",
     "serve": "tsx src/cli/index.ts serve",
     "dev": "tsx watch src/cli/index.ts",
     "test": "vitest run",
